@@ -793,7 +793,7 @@ int BlueFS::mkfs(uuid_d osd_uuid, const bluefs_layout_t& layout)
 
   // initial txn
   ceph_assert(log.seq_live == 1);
-  log.t.seq = 1;
+  log.t.reset(super.uuid);
   log.t.op_init();
   _flush_and_sync_log_LD();
 
@@ -1254,7 +1254,7 @@ void BlueFS::umount(bool avoid_compact)
   }
   _close_writer(log.writer);
   log.writer = NULL;
-  log.t.clear();
+  log.t.reset(super.uuid);
   // if we umount with pending release, we can possibly mount again
   // with pending release, and will release something that is not allocated
   for (auto& d: dirty.pending_release) {
@@ -1378,6 +1378,7 @@ int BlueFS::_open_super()
          << dendl;
     return -EIO;
   }
+  log.t.reset(super.uuid);
   dout(10) << __func__ << " superblock " << super.seq << dendl;
   dout(10) << __func__ << " log_fnode " << super.log_fnode << dendl;
   return 0;
@@ -1945,7 +1946,6 @@ int BlueFS::_replay(bool noop, bool to_stdout)
     vselector->add_usage(log_file->vselector_hint, log_file->fnode);
     log.seq_live = log_seq + 1;
     dirty.seq_live = log_seq + 1;
-    log.t.seq = log.seq_live;
     dirty.seq_stable = log_seq;
 
     for (const auto &[filename, file] : nodes.file_map) {
@@ -3014,9 +3014,7 @@ uint64_t BlueFS::_make_initial_transaction(uint64_t start_seq,
                                            uint64_t expected_final_size,
                                            bufferlist* out)
 {
-  bluefs_transaction_t t0;
-  t0.seq = start_seq;
-  t0.uuid = super.uuid;
+  bluefs_transaction_t t0(super.uuid, start_seq);
   t0.op_init();
   t0.op_file_update_inc(fnode);
   t0.op_jump(start_seq, expected_final_size); // this is a fixed size op,
@@ -3083,14 +3081,11 @@ bool BlueFS::_should_start_compact_log_L_N()
   return true;
 }
 
-void BlueFS::_compact_log_dump_metadata_NF(uint64_t start_seq,
-                                        bluefs_transaction_t *t,
+void BlueFS::_compact_log_dump_metadata_NF(bluefs_transaction_t *t,
 					int bdev_update_flags,
                                         uint64_t capture_before_seq)
 {
   dout(20) << __func__ << dendl;
-  t->seq = start_seq;
-  t->uuid = super.uuid;
 
   std::lock_guard nl(nodes.lock);
   bool all_files_plain = true;
@@ -3209,11 +3204,8 @@ void BlueFS::_rewrite_log_and_layout_sync_LNF_LD(bool permit_dev_fallback,
   auto t0 = mono_clock::now();
 
   File *log_file = log.writer->file.get();
-  // log.t.seq is always set to current live seq
-  ceph_assert(log.t.seq == log.seq_live);
   // Capturing entire state. Dump anything that has been stored there.
-  log.t.clear();
-  log.t.seq = log.seq_live;
+  log.t.reset(super.uuid);
   // From now on, no changes to log.t are permitted until we finish rewriting log.
   // Can allow dirty to remain dirty - log.seq_live will not change.
 
@@ -3253,8 +3245,8 @@ void BlueFS::_rewrite_log_and_layout_sync_LNF_LD(bool permit_dev_fallback,
 
 
   // 1.1 Build full compacted meta transaction
-  bluefs_transaction_t compacted_meta_t;
-  _compact_log_dump_metadata_NF(starter_seq + 1, &compacted_meta_t, flags, 0);
+  bluefs_transaction_t compacted_meta_t(super.uuid, starter_seq + 1);
+  _compact_log_dump_metadata_NF(&compacted_meta_t, flags, 0);
 
   // 1.2 Allocate the space required for the compacted meta transaction
   uint64_t compacted_meta_need =
@@ -3370,7 +3362,6 @@ void BlueFS::_rewrite_log_and_layout_sync_LNF_LD(bool permit_dev_fallback,
   // 2.4 Finalize log update
   ++log.seq_live;
   dirty.seq_live = log.seq_live;
-  log.t.seq = log.seq_live;
   vselector->sub_usage(log_file->vselector_hint, old_log_fnode);
   vselector->add_usage(log_file->vselector_hint, log_file->fnode);
 
@@ -3544,8 +3535,8 @@ void BlueFS::_compact_log_async_LD_LNF_D() //also locks FW for new_writer
   //
 
   // 2.1 Build full compacted meta transaction
-  bluefs_transaction_t compacted_meta_t;
-  _compact_log_dump_metadata_NF(starter_seq + 1, &compacted_meta_t, 0, seq_now);
+  bluefs_transaction_t compacted_meta_t(super.uuid, starter_seq + 1);
+  _compact_log_dump_metadata_NF(&compacted_meta_t, 0, seq_now);
 
   // now state is captured to compacted_meta_t,
   // current log can be used to write to,
@@ -3721,21 +3712,17 @@ void BlueFS::_pad_bl(bufferlist& bl, uint64_t pad_size)
 
 
 // Returns log seq that was live before advance.
-uint64_t BlueFS::_log_advance_seq()
+void BlueFS::_log_advance_seq_live()
 {
   ceph_assert(ceph_mutex_is_locked(dirty.lock));
   ceph_assert(ceph_mutex_is_locked(log.lock));
   //acquire new seq
   // this will became seq_stable once we write
   ceph_assert(dirty.seq_stable < dirty.seq_live);
-  ceph_assert(log.t.seq == log.seq_live);
-  uint64_t seq = log.seq_live;
-  log.t.uuid = super.uuid;
+  ceph_assert(dirty.seq_live == log.seq_live);
 
   ++dirty.seq_live;
   ++log.seq_live;
-  ceph_assert(dirty.seq_live == log.seq_live);
-  return seq;
 }
 
 
@@ -3781,7 +3768,7 @@ uint64_t BlueFS::_need_extend_log() {
   return 0;
 }
 
-void BlueFS::_extend_log(uint64_t amount) {
+void BlueFS::_extend_log(uint64_t seq, uint64_t amount) {
   ceph_assert(ceph_mutex_is_locked(log.lock));
   std::unique_lock<ceph::mutex> ll(log.lock, std::adopt_lock);
   while (log_forbidden_to_expand.load() == true) {
@@ -3799,12 +3786,14 @@ void BlueFS::_extend_log(uint64_t amount) {
         vselector->add_usage(log.writer->file->vselector_hint, e);
       });
   ceph_assert(r == 0);
-  dout(10) << "extended log by 0x" << std::hex << amount << " bytes " << dendl;
 
-  bluefs_transaction_t log_extend_transaction;
-  log_extend_transaction.seq = log.t.seq;
-  log_extend_transaction.uuid = log.t.uuid;
+  bluefs_transaction_t log_extend_transaction(super.uuid, seq);
   log_extend_transaction.op_file_update_inc(log.writer->file->fnode);
+
+  dout(10) << __func__ << std::hex
+           << " by 0x" << amount << " bytes, " << std::dec
+           << log_extend_transaction
+           << dendl;
 
   bufferlist bl;
   bl.reserve(super.block_size);
@@ -3812,19 +3801,14 @@ void BlueFS::_extend_log(uint64_t amount) {
   _pad_bl(bl, super.block_size);
   log.writer->append(bl);
   ceph_assert(allocated_before_extension >= log.writer->get_effective_write_pos());
-
-  // The extension transaction consumed seq log.t.seq (reserved by the
-  // caller under dirty.lock); step log.t.seq so the upcoming main
-  // transaction takes the next slot. seq_live is deliberately not
-  // touched here.
-  log.t.seq++;
 }
 
-void BlueFS::_flush_and_sync_log_core()
+void BlueFS::_flush_and_sync_log_core(uint64_t seq)
 {
   ceph_assert(ceph_mutex_is_locked(log.lock));
-  dout(10) << __func__ << " " << log.t << dendl;
 
+  log.t.seq = seq;
+  dout(10) << __func__ << " " << log.t << dendl;
 
   bufferlist bl;
   bl.reserve(super.block_size);
@@ -3846,8 +3830,7 @@ void BlueFS::_flush_and_sync_log_core()
   log.writer->append(bl);
 
   // prepare log for new transactions
-  log.t.clear();
-  log.t.seq = log.seq_live;
+  log.t.reset(super.uuid);
 
   uint64_t new_data = _flush_special(log.writer);
   vselector->add_usage(log.writer->file->vselector_hint, new_data);
@@ -3921,25 +3904,30 @@ int BlueFS::_flush_and_sync_log_LD(uint64_t want_seq)
   }
   
   ceph_assert(want_seq == 0 || want_seq <= dirty.seq_live); // illegal to request seq that was not created yet
-  uint64_t seq =_log_advance_seq();
+
+  uint64_t seq = log.seq_live;
   _consume_dirty(seq);
-  // Reserve a dedicated seq for the log-extension transaction (if one is
-  // needed) while dirty.lock is still held; otherwise a concurrent
+
+  // Reserve a dedicated seq for the log-extension transaction (if any)
+  // while dirty.lock is still held; otherwise a concurrent
   // _signal_dirty_to_log_D() could register a file under a seq that no
   // _consume_dirty() will ever visit (https://tracker.ceph.com/issues/79068).
   uint64_t extend_amount = _need_extend_log();
   if (extend_amount) {
-    ++dirty.seq_live;
-    ++log.seq_live;
+    _log_advance_seq_live();
   }
+  // Reserve a seq for normal transaction too
+  _log_advance_seq_live();
+
   vector<interval_set<uint64_t>> to_release(dirty.pending_release.size());
   to_release.swap(dirty.pending_release);
   dirty.lock.unlock();
 
   if (extend_amount) {
-    _extend_log(extend_amount);
+    _extend_log(seq, extend_amount);
+    seq++;
   }
-  _flush_and_sync_log_core();
+  _flush_and_sync_log_core(seq);
   _flush_bdev(log.writer);
   logger->set(l_bluefs_log_bytes, log.writer->file->fnode.size);
   //now log.lock is no longer needed
@@ -3961,12 +3949,14 @@ int BlueFS::_flush_and_sync_log_jump_D(uint64_t jump_to)
   // we synchronize writing to log, by lock to log.lock
 
   dirty.lock.lock();
-  uint64_t seq =_log_advance_seq();
+  uint64_t seq = log.seq_live;
   _consume_dirty(seq);
+  _log_advance_seq_live();
+
   vector<interval_set<uint64_t>> to_release(dirty.pending_release.size());
   to_release.swap(dirty.pending_release);
   dirty.lock.unlock();
-  _flush_and_sync_log_core();
+  _flush_and_sync_log_core(seq);
 
   dout(10) << __func__ << " jumping log offset from 0x" << std::hex
            << log.writer->get_pos() << " -> 0x" << jump_to << std::dec << dendl;
