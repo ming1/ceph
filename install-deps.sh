@@ -319,19 +319,6 @@ function install_boost_on_ubuntu {
 
 }
 
-function install_libzbd_on_ubuntu {
-    ci_debug "Running install_libzbd_on_ubuntu() in install-deps.sh"
-    local codename=$1
-    local project=libzbd
-    local sha1=1fadde94b08fab574b17637c2bebd2b1e7f9127b
-    install_pkg_on_ubuntu \
-        $project \
-        $sha1 \
-        $codename \
-        check \
-        libzbd-dev
-}
-
 function version_lt {
     test $1 != $(echo -e "$1\n$2" | sort -rV | head -n 1)
 }
@@ -551,12 +538,10 @@ else
             *Bionic*)
                 ensure_decent_gcc_on_ubuntu 9 bionic
                 [ ! $NO_BOOST_PKGS ] && install_boost_on_ubuntu bionic
-                $with_zbd && install_libzbd_on_ubuntu bionic
                 ;;
             *Focal*)
                 ensure_decent_gcc_on_ubuntu 11 focal
                 [ ! $NO_BOOST_PKGS ] && install_boost_on_ubuntu focal
-                $with_zbd && install_libzbd_on_ubuntu focal
                 ;;
             *Jammy*)
                 $SUDO apt-get install -y gcc
@@ -572,6 +557,10 @@ else
                 $SUDO apt-get install -y gcc
                 ;;
         esac
+        if $with_zbd; then
+            # libzbd is in the distribution's own archive
+            $SUDO apt-get install -y libzbd-dev
+        fi
         if ! test -r debian/control ; then
             echo debian/control is not a readable file
             exit 1

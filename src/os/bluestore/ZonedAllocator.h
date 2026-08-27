@@ -13,7 +13,7 @@
 
 #include <mutex>
 
-#include "Allocator.h"
+#include "AllocatorBase.h"
 #include "common/ceph_mutex.h"
 #include "include/btree_map.h"
 #include "include/interval_set.h"
@@ -21,7 +21,7 @@
 #include "bluestore_types.h"
 #include "zoned_types.h"
 
-class ZonedAllocator : public Allocator {
+class ZonedAllocator : public AllocatorBase {
   CephContext* cct;
 
   // Currently only one thread at a time calls into ZonedAllocator due to
@@ -96,6 +96,11 @@ public:
   void dump() override;
   void foreach(
     std::function<void(uint64_t offset, uint64_t length)> notify) override;
+  uint64_t get_free_extents(
+    uint64_t range_begin,
+    uint64_t range_end,
+    size_t max_count,
+    free_extent_vector_t* out) override;
 
   int64_t pick_zone_to_clean(float min_score, uint64_t min_saved);
   void set_cleaning_zone(uint32_t zone) {

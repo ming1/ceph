@@ -3792,7 +3792,7 @@ int BlueStore::_create_alloc()
   return 0;
 }
 
-int BlueStore::_init_alloc()
+int BlueStore::_init_alloc(std::map<uint64_t, uint64_t> *zone_adjustments)
 {
   int r = _create_alloc();
   if (r < 0) {
@@ -3927,7 +3927,7 @@ int BlueStore::_init_alloc()
   return 0;
 }
 
-void BlueStore::_post_init_alloc()
+void BlueStore::_post_init_alloc(const std::map<uint64_t, uint64_t>& zone_adjustments)
 {
   int r = 0;
 #ifdef HAVE_LIBZBD
@@ -4408,6 +4408,10 @@ int BlueStore::_open_db_and_around(
     }
   }
 
+  // SMR devices may require a freelist adjustment, but that can only happen after
+  // the db is read-write. we'll stash pending changes here.
+  std::map<uint64_t, uint64_t> zone_adjustments;
+
   int r = _open_path();
   if (r < 0)
     return r;
@@ -4445,7 +4449,7 @@ int BlueStore::_open_db_and_around(
   if (r < 0)
     goto out_db;
 
-  r = _init_alloc();
+  r = _init_alloc(&zone_adjustments);
   if (r < 0)
     goto out_fm;
 
@@ -4471,7 +4475,7 @@ int BlueStore::_open_db_and_around(
   }
 
   if (!read_only) {
-    _post_init_alloc();
+    _post_init_alloc(zone_adjustments);
   }
 
   if (replay_deferred && !keys_to_remove.empty()) {

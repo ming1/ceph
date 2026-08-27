@@ -11,6 +11,7 @@
 
 #include "ZonedFreelistManager.h"
 #include "bluestore_common.h"
+#include "common/strtol.h" // for strict_iecstrtoll()
 #include "include/stringify.h"
 #include "kv/KeyValueDB.h"
 #include "os/kv.h"
@@ -285,6 +286,16 @@ void ZonedFreelistManager::release(
   }
 }
 
+int ZonedFreelistManager::expand(uint64_t new_size, KeyValueDB* db)
+{
+  if (new_size == size) {
+    return 0;
+  }
+  derr << __func__ << " cannot expand a zoned freelist from 0x" << std::hex
+       << size << " to 0x" << new_size << std::dec << dendl;
+  return -EOPNOTSUPP;
+}
+
 void ZonedFreelistManager::get_meta(
   uint64_t target_size,
   std::vector<std::pair<string, string>>* res) const
@@ -296,6 +307,22 @@ void ZonedFreelistManager::get_meta(
   res->emplace_back("zfm_zone_size", stringify(zone_size));
   res->emplace_back("zfm_num_zones", stringify(num_zones));
   res->emplace_back("zfm_starting_zone_num", stringify(starting_zone_num));
+}
+
+bool ZonedFreelistManager::validate(uint64_t min_alloc_size) const
+{
+  bool ret = true;
+  auto my_alloc_size = get_alloc_size();
+  ceph_assert(my_alloc_size);
+  ceph_assert(min_alloc_size);
+  if (!is_null_manager() &&
+       ((min_alloc_size < my_alloc_size) || (min_alloc_size % my_alloc_size))) {
+    derr << __func__ << " inconsistent alloc units:" << std::hex
+         << "0x" << get_alloc_size() << " vs. 0x" << min_alloc_size
+         << std::dec << dendl;
+    ret = false;
+  }
+  return ret;
 }
 
 std::vector<zone_state_t> ZonedFreelistManager::get_zone_states(

@@ -1025,17 +1025,6 @@ namespace bluestore {
     printer print(uint16_t mode, uint32_t from, uint32_t end) const {
       return printer(*this, mode, from, end);
     }
-#ifdef HAVE_LIBZBD
-    // Return the offset of an object on disk.  This function is intended *only*
-    // for use with zoned storage devices because in these devices, the objects
-    // are laid out contiguously on disk, which is not the case in general.
-    // Also, it should always be called after calling extent_map.fault_range(),
-    // so that the extent map is loaded.
-    int64_t zoned_get_ondisk_starting_offset() const {
-      return extent_map.extent_map.begin()->blob->
-	  get_blob().calc_offset(0, nullptr);
-    }
-#endif
   };
 } // namespace bluestore
 

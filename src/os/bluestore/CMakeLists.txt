@@ -25,6 +25,12 @@ add_library(bluestore OBJECT
   BlueAdmin.cc
   BlueEnv.cc)
 
+if(WITH_ZBD)
+  target_sources(bluestore PRIVATE
+    ZonedAllocator.cc
+    ZonedFreelistManager.cc)
+endif()
+
 target_link_libraries(bluestore
   PRIVATE
     blk heap_profiler kv ${FMT_LIB})

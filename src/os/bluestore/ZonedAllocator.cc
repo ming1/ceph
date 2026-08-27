@@ -24,7 +24,7 @@ ZonedAllocator::ZonedAllocator(CephContext* cct,
 			       int64_t _zone_size,
 			       int64_t _first_sequential_zone,
 			       std::string_view name)
-    : Allocator(name, size, blk_size),
+    : AllocatorBase(name, size, blk_size),
       cct(cct),
       size(size),
       conventional_size(_first_sequential_zone * _zone_size),
@@ -148,6 +148,42 @@ void ZonedAllocator::foreach(
   std::function<void(uint64_t offset, uint64_t length)> notify)
 {
   std::lock_guard l(lock);
+}
+
+uint64_t ZonedAllocator::get_free_extents(
+  uint64_t range_begin,
+  uint64_t range_end,
+  size_t max_count,
+  free_extent_vector_t* out)
+{
+  ceph_assert(range_begin <= range_end);
+  if (range_begin == range_end) {
+    return range_end;
+  }
+  std::lock_guard l(lock);
+  // Batched counterpart of foreach(): walk the zones overlapping the window and
+  // emit each zone's free tail, clipped to the window.
+  uint64_t zone = std::max(range_begin / zone_size, first_seq_zone_num);
+  size_t n = 0;
+  max_count--;  // 0 wraps to SIZE_MAX, i.e. unbounded, as in the other allocators
+  for (; zone < num_zones && zone * zone_size < range_end; ++zone) {
+    uint64_t wp = get_write_pointer(zone);
+    if (wp >= zone_size) {
+      continue;
+    }
+    uint64_t lo = std::max(zone * zone_size + wp, range_begin);
+    uint64_t hi = std::min(zone * zone_size + zone_size, range_end);
+    if (lo >= hi) {
+      continue;
+    }
+    if (n > max_count) {
+      // Stopped on the count cap: resume at the start of this zone.
+      return zone * zone_size;
+    }
+    out->emplace_back(lo, hi - lo);
+    ++n;
+  }
+  return range_end;
 }
 
 void ZonedAllocator::init_from_zone_pointers(
