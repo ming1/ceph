@@ -3,6 +3,9 @@
 
 #include "FreelistManager.h"
 #include "BitmapFreelistManager.h"
+#ifdef HAVE_LIBZBD
+#include "ZonedFreelistManager.h"
+#endif
 
 FreelistManager *FreelistManager::create(
   CephContext* cct,
@@ -30,5 +33,10 @@ FreelistManager *FreelistManager::create(
 void FreelistManager::setup_merge_operators(KeyValueDB *db,
 					    const std::string& type)
 {
-  BitmapFreelistManager::setup_merge_operator(db, "b");
+#ifdef HAVE_LIBZBD
+  if (type == "zoned")
+    ZonedFreelistManager::setup_merge_operator(db, "z");
+  else
+#endif
+    BitmapFreelistManager::setup_merge_operator(db, "b");
 }

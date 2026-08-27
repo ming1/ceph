@@ -34,6 +34,8 @@ ARCH=$(uname -m)
 function munge_ceph_spec_in {
     local with_crimson=$1
     shift
+    local with_zbd=$1
+    shift
     local for_make_check=$1
     shift
     local with_fdb=$1
@@ -43,6 +45,9 @@ function munge_ceph_spec_in {
     # http://rpm.org/user_doc/conditional_builds.html
     if ! $with_crimson; then
         sed -i -e 's/%bcond_without crimson/%bcond_with crimson/g' $OUTFILE
+    fi
+    if $with_zbd; then
+        sed -i -e 's/%bcond_with zbd/%bcond_without zbd/g' $OUTFILE
     fi
     if $for_make_check; then
         sed -i -e 's/%bcond_with make_check/%bcond_without make_check/g' $OUTFILE
@@ -314,6 +319,19 @@ function install_boost_on_ubuntu {
 
 }
 
+function install_libzbd_on_ubuntu {
+    ci_debug "Running install_libzbd_on_ubuntu() in install-deps.sh"
+    local codename=$1
+    local project=libzbd
+    local sha1=1fadde94b08fab574b17637c2bebd2b1e7f9127b
+    install_pkg_on_ubuntu \
+        $project \
+        $sha1 \
+        $codename \
+        check \
+        libzbd-dev
+}
+
 function version_lt {
     test $1 != $(echo -e "$1\n$2" | sort -rV | head -n 1)
 }
@@ -489,6 +507,7 @@ if [ x$(uname)x = xFreeBSDx ]; then
     exit
 else
     [ $WITH_CRIMSON ] && with_crimson=true || with_crimson=false
+    [ $WITH_ZBD ] && with_zbd=true || with_zbd=false
     case "${WITH_RADOSGW_FDB:-OFF}" in
         1|ON|on|true|yes) with_fdb=true ;;
         0|OFF|off|false|no) with_fdb=false ;;
@@ -532,10 +551,12 @@ else
             *Bionic*)
                 ensure_decent_gcc_on_ubuntu 9 bionic
                 [ ! $NO_BOOST_PKGS ] && install_boost_on_ubuntu bionic
+                $with_zbd && install_libzbd_on_ubuntu bionic
                 ;;
             *Focal*)
                 ensure_decent_gcc_on_ubuntu 11 focal
                 [ ! $NO_BOOST_PKGS ] && install_boost_on_ubuntu focal
+                $with_zbd && install_libzbd_on_ubuntu focal
                 ;;
             *Jammy*)
                 $SUDO apt-get install -y gcc
@@ -621,7 +642,7 @@ else
         if [ "$INSTALL_EXTRA_PACKAGES" ]; then
             $SUDO dnf install -y $INSTALL_EXTRA_PACKAGES
         fi
-        munge_ceph_spec_in "$with_crimson" "$for_make_check" "$with_fdb" "$DIR/ceph.spec"
+        munge_ceph_spec_in "$with_crimson" "$with_zbd" "$for_make_check" "$with_fdb" "$DIR/ceph.spec"
         # for python3_pkgversion macro defined by python-srpm-macros, which is required by python3-devel
         $SUDO dnf install -y python3-devel
         if $with_fdb; then
@@ -642,7 +663,7 @@ else
         if [ "$INSTALL_EXTRA_PACKAGES" ]; then
             $SUDO $zypp_install $INSTALL_EXTRA_PACKAGES
         fi
-        munge_ceph_spec_in "$with_crimson" "$for_make_check" "$with_fdb" "$DIR/ceph.spec"
+        munge_ceph_spec_in "$with_crimson" "$with_zbd" "$for_make_check" "$with_fdb" "$DIR/ceph.spec"
         $SUDO $zypp_install $(rpmspec -q --buildrequires $DIR/ceph.spec) || exit 1
         ;;
     *)

@@ -21,6 +21,7 @@
 # https://rpm-software-management.github.io/rpm/manual/conditionalbuilds.html
 #################################################################################
 %bcond_with make_check
+%bcond_with zbd
 %bcond_with cmake_verbose_logging
 %bcond_without ceph_test_package
 %bcond_with radosgw_fdb
@@ -354,6 +355,9 @@ BuildRequires:	python3dist(requests-mock)
 BuildRequires:	python3dist(kubernetes)
 BuildRequires:	python3dist(asyncmock)
 BuildRequires:	python3dist(types-pyyaml)
+%endif
+%if 0%{with zbd}
+BuildRequires:  libzbd-devel
 %endif
 %endif
 BuildRequires:	pkgconfig(thrift) >= 0.13.0
@@ -1815,6 +1819,9 @@ cmake .. \
     -DWITH_RADOSGW_LANCEDB:BOOL=ON \
 %else
     -DWITH_RADOSGW_LANCEDB:BOOL=OFF \
+%endif
+%if 0%{with zbd}
+    -DWITH_ZBD:BOOL=ON \
 %endif
 %if 0%{with cmake_verbose_logging}
     -DCMAKE_VERBOSE_MAKEFILE:BOOL=ON \

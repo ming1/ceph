@@ -10,6 +10,9 @@
 #include "BtreeAllocator.h"
 #include "Btree2Allocator.h"
 #include "HybridAllocator.h"
+#ifdef HAVE_LIBZBD
+#include "ZonedAllocator.h"
+#endif
 #include "common/debug.h"
 #include "common/admin_socket.h"
 
