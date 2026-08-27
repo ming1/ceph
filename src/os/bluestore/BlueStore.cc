@@ -11678,6 +11678,7 @@ void BlueStore::_txc_finish(TransContext *txc)
   OpSequencerRef osr = txc->osr;
   bool empty = false;
   bool submit_deferred = false;
+  const bool zoned = bdev->is_smr();
   OpSequencer::q_list_t releasing_txc;
   {
     std::lock_guard l(osr->qlock);
@@ -11701,6 +11702,15 @@ void BlueStore::_txc_finish(TransContext *txc)
       }
 
       osr->q.pop_front();
+      if (zoned) {
+	// Hand the released space back while the txc still counts as queued
+	// for drain(): the zone cleaner drains the sequencers and then reads
+	// the live bytes of a zone, and must not see the count before this
+	// release.  It is safe to do it this early: there are no deferred
+	// writes on a zoned device, and a release only raises the dead bytes
+	// of the zone (space is reused after a zone reset, never in place).
+	_txc_release_alloc(txc);
+      }
       releasing_txc.push_back(*txc);
     }
 
@@ -11754,7 +11764,11 @@ void BlueStore::_txc_release_alloc(TransContext *txc)
                !alloc)) {
       goto out;
   }
-  discard_queued = bdev->try_discard(txc->released);
+  // A sequential zone is reclaimed as a whole by a zone reset, so there is
+  // nothing to discard on a zoned device.  An async discard would also give
+  // the space back to the allocator at some later time, which the zone
+  // cleaner cannot wait for.
+  discard_queued = !bdev->is_smr() && bdev->try_discard(txc->released);
   // if async discard succeeded, will do alloc->release when discard callback
   // else we should release here
   if (!discard_queued) {
