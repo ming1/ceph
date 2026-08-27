@@ -14687,6 +14687,13 @@ int BlueStore::_do_write_v2(
 
   WriteContext wctx;
   _choose_write_options(c, o, fadvise_flags, &wctx);
+  // For zoned/SMR devices, collect the physical extents this write allocates
+  // and releases so we can maintain the per-zone cleaner references afterwards
+  // (the v2 path does not go through _wctx_finish()).
+  const bool is_smr = bdev->is_smr();
+  PExtentVector zoned_allocated, zoned_released;
+  PExtentVector* z_alloc = is_smr ? &zoned_allocated : nullptr;
+  PExtentVector* z_rel = is_smr ? &zoned_released : nullptr;
   if (wctx.compressor) {
     uint32_t end = offset + length;
     uint32_t segment_size = o->onode.segment_size;
@@ -14701,7 +14708,7 @@ int BlueStore::_do_write_v2(
         bufferlist chunk;
         bl.splice(0, write_length, &chunk);
         _do_write_v2_compressed(txc, c, o, wctx, write_offset, write_length, chunk,
-                                this_segment_begin, this_segment_end);
+                                this_segment_begin, this_segment_end, z_alloc, z_rel);
         write_offset += write_length;
       };
     } else {
@@ -14709,7 +14716,7 @@ int BlueStore::_do_write_v2(
       uint32_t scan_left = offset < scan_range ? 0: offset - scan_range;
       uint32_t scan_right = end + scan_range;
       _do_write_v2_compressed(txc, c, o, wctx, offset, length, bl,
-                              scan_left, scan_right);
+                              scan_left, scan_right, z_alloc, z_rel);
     }
   } else {
     // normal uncompressed path
@@ -14721,6 +14728,18 @@ int BlueStore::_do_write_v2(
     wr.do_write(offset, bl);
     o->extent_map.dirty_range(wr.left_affected_range, wr.right_affected_range - wr.left_affected_range);
     o->extent_map.maybe_reshard(wr.left_affected_range, wr.right_affected_range);
+    if (is_smr) {
+      const auto& a = wr.get_allocated();
+      const auto& rl = wr.get_released();
+      zoned_allocated.insert(zoned_allocated.end(), a.begin(), a.end());
+      zoned_released.insert(zoned_released.end(), rl.begin(), rl.end());
+    }
+  }
+  // The v2 write path does not go through _wctx_finish(), so it never updates
+  // the per-zone cleaner references the zoned GC relies on.  Maintain them from
+  // the extents this write allocated/released.
+  if (is_smr) {
+    zoned.update_zone_refs(txc, o, zoned_allocated, zoned_released);
   }
   return r;
 }
@@ -14732,7 +14751,8 @@ int BlueStore::_do_write_v2_compressed(
   WriteContext& wctx,
   uint32_t offset, uint32_t length,
   ceph::buffer::list& input_bl,
-  uint32_t scan_left, uint32_t scan_right)
+  uint32_t scan_left, uint32_t scan_right,
+  PExtentVector* zoned_allocated, PExtentVector* zoned_released)
 {
   o->extent_map.fault_range(db, scan_left, scan_right - scan_left);
   if (!c->estimator) c->estimator.reset(create_estimator());
@@ -14784,6 +14804,12 @@ int BlueStore::_do_write_v2_compressed(
     }
     changes_start = std::min(changes_start, wr.left_affected_range);
     changes_end = std::max(changes_end, wr.right_affected_range);
+    if (zoned_allocated) {
+      const auto& a = wr.get_allocated();
+      const auto& rl = wr.get_released();
+      zoned_allocated->insert(zoned_allocated->end(), a.begin(), a.end());
+      zoned_released->insert(zoned_released->end(), rl.begin(), rl.end());
+    }
   }
   estimator->finish();
   o->extent_map.compress_extent_map(changes_start, changes_end - changes_start);

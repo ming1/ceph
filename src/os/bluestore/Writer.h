@@ -81,6 +81,13 @@ public:
     std::function<void(uint32_t offset, const bufferlist& data)> data_callback
   );
 
+  // Physical extents allocated / released by the last do_write*() call.
+  // Used by the zoned write path to maintain per-zone cleaner references.
+  // (allocated/released are moved to the txc and cleared at the end of the
+  // write, so these are saved copies taken just before that.)
+  const PExtentVector& get_allocated() const { return saved_allocated; }
+  const PExtentVector& get_released() const { return saved_released; }
+
   write_divertor* test_write_divertor = nullptr;
   read_divertor* test_read_divertor = nullptr;
   std::vector<BlobRef> pruned_blobs;
@@ -91,11 +98,14 @@ public:
   uint32_t right_affected_range; // get after: range of affected blobs
 private:
   BlueStore* bstore;
+  bool _is_smr() const;  ///< the main device is zoned (HM-SMR, ZNS)
   TransContext* txc;
   WriteContext* wctx;
   OnodeRef onode;
   PExtentVector released;   //filled by punch_hole
   PExtentVector allocated;  //filled by alloc()
+  PExtentVector saved_released;   //released, retained for get_released()
+  PExtentVector saved_allocated;  //allocated, retained for get_allocated()
   bool do_deferred = false;
   // note: disk_allocs.it is uninitialized.
   //       it must be initialized in do_write
