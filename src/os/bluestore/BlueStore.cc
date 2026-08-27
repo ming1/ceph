@@ -3653,7 +3653,7 @@ int BlueStore::_open_fm(KeyValueDB::Transaction t,
     }
 
     fm->create(bdev->get_size(), alloc_size,
-	       zoned.zone_size, zoned.first_sequential_zone,
+	       zoned.zone_size, zoned.zone_capacity, zoned.first_sequential_zone,
 	       t);
 
     auto reserved = _get_ondisk_reserved();
@@ -3750,6 +3750,7 @@ int BlueStore::_create_alloc()
     bdev->get_size(),
     alloc_size,
     zoned.zone_size,
+    zoned.zone_capacity,
     zoned.first_sequential_zone,
     "block");
   if (!alloc) {
@@ -8937,6 +8938,17 @@ void BlueStore::_get_statfs_overall(struct store_statfs_t *buf)
     bfree = std::min(bfree, ebd_state.get_physical_avail());
 
     buf->allocated = ebd_state.get_physical_total() - ebd_state.get_physical_avail();;
+  } else if (bdev->is_smr()) {
+    // On a zoned device only the first |zone_capacity| bytes of each
+    // sequential zone are writeable; the [zone_capacity, zone_size) tail of
+    // every sequential zone is an unusable gap.  Report the writeable
+    // capacity rather than the raw device size, so the rest of Ceph (df, full
+    // ratios, balancer, ...) sees the space the OSD can actually use and it
+    // stays consistent with the (already zone_capacity-based) free space.
+    uint64_t num_zones = bdev->get_size() / zoned.zone_size;
+    uint64_t num_seq_zones = num_zones - zoned.first_sequential_zone;
+    uint64_t unwriteable = num_seq_zones * (zoned.zone_size - zoned.zone_capacity);
+    buf->total += bdev->get_size() - unwriteable;
   } else {
     buf->total += bdev->get_size();
   }
@@ -11104,6 +11116,21 @@ int BlueStore::_open_super_meta()
       ceph_assert(bdev->is_smr());
     } else {
       ceph_assert(!bdev->is_smr());
+    }
+  }
+  {
+    bufferlist bl;
+    int r = db->get(PREFIX_SUPER, "zone_capacity", &bl);
+    if (r >= 0) {
+      auto p = bl.cbegin();
+      decode(zoned.zone_capacity, p);
+      dout(1) << __func__ << " zone_capacity 0x" << std::hex << zoned.zone_capacity
+	      << std::dec << dendl;
+      ceph_assert(bdev->is_smr());
+    } else {
+      // zone_capacity was added with ZNS support; OSDs created before that
+      // (HM-SMR) have capacity == zone_size.
+      zoned.zone_capacity = zoned.zone_size;
     }
   }
   {
@@ -17333,7 +17360,8 @@ Allocator* BlueStore::create_bitmap_allocator(uint64_t bdev_size) {
   // create allocator
   uint64_t alloc_size = min_alloc_size;
   Allocator* alloc = Allocator::create(cct, "bitmap", bdev_size, alloc_size,
-				       zoned.zone_size, zoned.first_sequential_zone,
+				       zoned.zone_size, zoned.zone_capacity,
+				       zoned.first_sequential_zone,
 				       "recovery");
   if (alloc) {
     return alloc;

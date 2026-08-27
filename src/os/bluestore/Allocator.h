@@ -151,6 +151,7 @@ public:
     int64_t size,
     int64_t block_size,
     int64_t zone_size = 0,
+    int64_t zone_capacity = 0,
     int64_t first_sequential_zone = 0,
     const std::string_view name = ""
     );

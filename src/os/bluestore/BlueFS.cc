@@ -908,7 +908,7 @@ void BlueFS::_init_alloc()
                                     alloc_type,
 				    full_size,
 				    bdev[id]->get_block_size(),
-				    0, 0,
+				    0, 0, 0,
 				    name);
       alloc[id]->init_add_free(reserved, full_size - reserved);
     }

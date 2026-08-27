@@ -32,10 +32,11 @@ class ZonedAllocator : public AllocatorBase {
   ceph::mutex lock = ceph::make_mutex("ZonedAllocator::lock");
 
   uint64_t size;
-  uint64_t conventional_size, sequential_size;
+  uint64_t sequential_size;
   std::atomic<int64_t> num_sequential_free;  ///< total bytes in freelist
   uint64_t block_size;
   uint64_t zone_size;
+  uint64_t zone_capacity;  ///< usable bytes per zone (<= zone_size on ZNS)
   uint64_t first_seq_zone_num;
   uint64_t starting_zone_num;
   uint64_t num_zones;
@@ -57,7 +58,9 @@ public:
   }
 private:
   inline uint64_t get_remaining_space(uint64_t zone_num) const {
-    return zone_size - get_write_pointer(zone_num);
+    // Only the first |zone_capacity| bytes of a zone are usable; the tail
+    // [zone_capacity, zone_size) is an unwritable gap on ZNS devices.
+    return zone_capacity - get_write_pointer(zone_num);
   }
 
   inline void increment_write_pointer(uint64_t zone_num, uint64_t want_size) {
@@ -75,6 +78,7 @@ private:
 public:
   ZonedAllocator(CephContext* cct, int64_t size, int64_t block_size,
 		 int64_t _zone_size,
+		 int64_t _zone_capacity,
 		 int64_t _first_sequential_zone,
 		 std::string_view name);
   ~ZonedAllocator() override;

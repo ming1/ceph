@@ -22,28 +22,35 @@ ZonedAllocator::ZonedAllocator(CephContext* cct,
 			       int64_t size,
 			       int64_t blk_size,
 			       int64_t _zone_size,
+			       int64_t _zone_capacity,
 			       int64_t _first_sequential_zone,
 			       std::string_view name)
     : AllocatorBase(name, size, blk_size),
       cct(cct),
       size(size),
-      conventional_size(_first_sequential_zone * _zone_size),
-      sequential_size(size - conventional_size),
+      // Sequential zones may have capacity < size on ZNS, so only count the
+      // usable per-zone capacity towards the sequential free space.
+      sequential_size((size / _zone_size - _first_sequential_zone) *
+		      _zone_capacity),
       num_sequential_free(0),
       block_size(blk_size),
       zone_size(_zone_size),
+      zone_capacity(_zone_capacity),
       first_seq_zone_num(_first_sequential_zone),
       starting_zone_num(first_seq_zone_num),
       num_zones(size / zone_size)
 {
   ldout(cct, 10) << " size 0x" << std::hex << size
-		 << ", zone size 0x" << zone_size << std::dec
+		 << ", zone size 0x" << zone_size
+		 << ", zone capacity 0x" << zone_capacity << std::dec
 		 << ", number of zones 0x" << num_zones
 		 << ", first sequential zone 0x" << starting_zone_num
 		 << ", sequential size 0x" << sequential_size
 		 << std::dec
 		 << dendl;
   ceph_assert(size % zone_size == 0);
+  ceph_assert(zone_capacity > 0);
+  ceph_assert(zone_capacity <= zone_size);
 
   zone_states.resize(num_zones);
 }
@@ -167,10 +174,10 @@ void ZonedAllocator::foreach(
   // fragmentation" health warning.
   for (uint64_t zone = first_seq_zone_num; zone < num_zones; ++zone) {
     uint64_t wp = get_write_pointer(zone);
-    if (wp >= zone_size) {
+    if (wp >= zone_capacity) {
       continue;
     }
-    notify(zone * zone_size + wp, zone_size - wp);
+    notify(zone * zone_size + wp, zone_capacity - wp);
   }
 }
 
@@ -192,11 +199,11 @@ uint64_t ZonedAllocator::get_free_extents(
   max_count--;  // 0 wraps to SIZE_MAX, i.e. unbounded, as in the other allocators
   for (; zone < num_zones && zone * zone_size < range_end; ++zone) {
     uint64_t wp = get_write_pointer(zone);
-    if (wp >= zone_size) {
+    if (wp >= zone_capacity) {
       continue;
     }
     uint64_t lo = std::max(zone * zone_size + wp, range_begin);
-    uint64_t hi = std::min(zone * zone_size + zone_size, range_end);
+    uint64_t hi = std::min(zone * zone_size + zone_capacity, range_end);
     if (lo >= hi) {
       continue;
     }
@@ -219,7 +226,9 @@ void ZonedAllocator::init_from_zone_pointers(
   zone_states = std::move(_zone_states);
   num_sequential_free = 0;
   for (size_t i = first_seq_zone_num; i < num_zones; ++i) {
-    num_sequential_free += zone_size - (zone_states[i].write_pointer % zone_size);
+    // The write pointer is relative to the start of the zone and never exceeds
+    // the usable capacity, so the free space is capacity - write_pointer.
+    num_sequential_free += zone_capacity - zone_states[i].write_pointer;
   }
   ldout(cct, 10) << "free 0x" << std::hex << num_sequential_free
 		 << " / 0x" << sequential_size << std::dec
