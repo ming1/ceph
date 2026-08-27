@@ -506,16 +506,22 @@ void BlueStoreZoned::clean_zone(
     clean_some(oid, zone);
   }
 
+  // The relocations above are asynchronous transactions.  Drain them before
+  // looking at the live bytes, and before the zone is blown away.
+  bstore->_osr_drain_all();
+
+  // The drain waits until the transactions have left their sequencers.  The
+  // extents a transaction freed go back to the allocator, which raises the
+  // dead bytes of the zone, a moment after that.  So live bytes here are
+  // either data that could not be moved, or a release that is not counted
+  // yet.  In the second case the cleaner picks the zone again, and resets it
+  // then.
   if (a->get_live_bytes(zone) > 0) {
     derr << "zone 0x" << std::hex << zone << " still has 0x" << a->get_live_bytes(zone)
 	 << " live bytes" << std::dec << dendl;
     // should we do something else here to avoid a live-lock in the event of a problem?
     return;
   }
-
-  // make sure transactions flush/drain/commit (and data is all rewritten
-  // safely elsewhere) before we blow away the cleaned zone
-  bstore->_osr_drain_all();
 
   // reset the device zone
   dout(10) << __func__ << " resetting zone 0x" << std::hex << zone << std::dec << dendl;

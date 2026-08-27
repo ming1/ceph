@@ -11755,7 +11755,11 @@ void BlueStore::_txc_release_alloc(TransContext *txc)
                !alloc)) {
       goto out;
   }
-  discard_queued = bdev->try_discard(txc->released);
+  // A sequential zone is reclaimed as a whole by a zone reset, so there is
+  // nothing to discard on a zoned device.  An async discard would also give
+  // the space back to the allocator at some later time, and the zone cleaner
+  // cannot reset a zone before that.
+  discard_queued = !bdev->is_smr() && bdev->try_discard(txc->released);
   // if async discard succeeded, will do alloc->release when discard callback
   // else we should release here
   if (!discard_queued) {
