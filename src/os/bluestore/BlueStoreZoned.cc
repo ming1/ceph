@@ -18,6 +18,8 @@
 // Without it no block device reports is_smr(), and BlueStoreZoned.h has
 // inline stubs instead.
 
+#include <sys/stat.h>
+
 #include "BlueStore.h"
 #include "BlueStoreZoned.h"
 #include "BlueStore_objects.h"
@@ -176,12 +178,22 @@ int BlueStoreZoned::init_alloc(std::map<uint64_t, uint64_t> *zone_adjustments)
 
   // start with conventional zone "free" (bluefs may adjust this when it starts up)
   auto reserved = bstore->_get_ondisk_reserved();
-  // for now we require a conventional zone
-  ceph_assert(bstore->bdev->get_conventional_region_size());
   ceph_assert(bstore->shared_alloc.a != bstore->alloc);  // zoned allocator doesn't use conventional region
-  bstore->shared_alloc.a->init_add_free(
-    reserved,
-    p2align(bstore->bdev->get_conventional_region_size(), bstore->min_alloc_size) - reserved);
+  if (bstore->bdev->get_conventional_region_size()) {
+    // HM-SMR (and ZNS drives that expose conventional zones): the randomly
+    // writable conventional region hosts BlueFS/metadata and the bdev label.
+    bstore->shared_alloc.a->init_add_free(
+      reserved,
+      p2align(bstore->bdev->get_conventional_region_size(), bstore->min_alloc_size) - reserved);
+  } else {
+    // Pure ZNS: there is no conventional region, so BlueFS/RocksDB must live
+    // on a dedicated conventional db device.  The main device holds only the
+    // write-once bdev label (reserved within the first sequential zone via
+    // the zoned freelist) followed by sequential object data, so there is no
+    // shared/conventional free space to hand to BlueFS here.
+    dout(1) << __func__ << " no conventional region on main device;"
+	    << " BlueFS/metadata must reside on a dedicated db device" << dendl;
+  }
 
   // init sequential zone based on the device's write pointers
   a->init_from_zone_pointers(std::move(zones));
@@ -242,12 +254,32 @@ void BlueStoreZoned::post_init_alloc(const std::map<uint64_t, uint64_t>& zone_ad
   ceph_assert(r >= 0);
 }
 
-void BlueStoreZoned::mkfs_prepare()
+int BlueStoreZoned::mkfs_prepare()
 {
   auto bdev = bstore->bdev;
   zone_size = bdev->get_zone_size();
   zone_capacity = bdev->get_zone_capacity();
   first_sequential_zone = bdev->get_conventional_region_size() / zone_size;
+
+  // A zoned device with no conventional region (pure ZNS) cannot host the
+  // randomly-written BlueFS/RocksDB metadata or the bdev label rewrites, so
+  // a dedicated conventional db device (block.db) is mandatory.  Check that
+  // before the zones are reset: a mkfs that fails here must leave the device
+  // as it was.
+  if (bdev->get_conventional_region_size() == 0) {
+    struct stat st;
+    if (::stat((bstore->path + "/block.db").c_str(), &st) != 0) {
+      derr << __func__ << " zoned device " << bstore->path << "/block has no"
+	   << " conventional region; a dedicated conventional db device"
+	   << " (block.db) is required. Provision one via"
+	   << " 'bluestore block db path' (e.g. vstart --bluestore-db-devs)."
+	   << dendl;
+      return -EINVAL;
+    }
+    dout(1) << __func__ << " pure-ZNS main device; using dedicated db device"
+	    << " for BlueFS/metadata" << dendl;
+  }
+
   if (bstore->cct->_conf.get_val<bool>("bluestore_assume_clean_zones")) {
     // The operator states that every zone is already empty, so the reset
     // (slow on large drives) is skipped.
@@ -258,17 +290,50 @@ void BlueStoreZoned::mkfs_prepare()
     bdev->reset_all_zones();
     dout(1) << __func__ << " done resetting all zones" << dendl;
   }
+  return 0;
 }
 
-void BlueStoreZoned::mkfs_init_main_device(uint64_t reserved)
+int BlueStoreZoned::mkfs_init_main_device(uint64_t reserved)
 {
   auto bdev = bstore->bdev;
-  if (bstore->alloc != bstore->shared_alloc.a) {
-    bstore->shared_alloc.a->init_add_free(
-      reserved,
-      p2align(bdev->get_conventional_region_size(),
-	      bstore->min_alloc_size) - reserved);
+  if (bdev->get_conventional_region_size()) {
+    // Only HM-SMR / ZNS drives with a conventional region give BlueFS shared
+    // space on the main device.  Pure ZNS has none (BlueFS uses block.db).
+    if (bstore->alloc != bstore->shared_alloc.a) {
+      bstore->shared_alloc.a->init_add_free(
+	reserved,
+	p2align(bdev->get_conventional_region_size(),
+		bstore->min_alloc_size) - reserved);
+    }
+    return 0;
   }
+
+  // Pure ZNS: sequential zone 0 is empty here, wiped by reset_all_zones() in
+  // mkfs_prepare() or empty already with bluestore_assume_clean_zones, so
+  // (re)write the bdev label there now (it was deferred by _open_bdev) and pad
+  // the rest of the reserved region with zeros.  This advances the device
+  // write pointer to |reserved|, matching the region reserved in the zoned
+  // freelist (fm->allocate in _open_fm), so object data is written
+  // sequentially afterwards.
+  int r = bstore->_set_main_bdev_label();
+  if (r < 0) {
+    return r;
+  }
+  uint64_t label_end = std::max<uint64_t>(BDEV_LABEL_BLOCK_SIZE,
+					  bstore->block_size);
+  if (reserved > label_end) {
+    bufferlist pad;
+    pad.append(ceph::buffer::create_page_aligned(reserved - label_end));
+    pad.zero();
+    r = bdev->write(label_end, pad, false);
+    if (r < 0) {
+      derr << __func__ << " failed to pad pure-ZNS reserved region: "
+	   << cpp_strerror(r) << dendl;
+      return r;
+    }
+  }
+  bdev->flush();
+  return 0;
 }
 
 void BlueStoreZoned::mkfs_super(KeyValueDB::Transaction& t)
@@ -655,9 +720,12 @@ void BlueStoreZoned::fsck_check_zones(
 
   used_blocks.flip();
 
-  // skip conventional zones
-  uint64_t pos = (first_sequential_zone * zone_size) / bstore->min_alloc_size - 1;
-  pos = used_blocks.find_next(pos);
+  // skip conventional zones; find the first free block at/after the start
+  // of the sequential region.  On a pure-ZNS device first_sequential_zone
+  // is 0, so guard against underflow of the (start - 1) bit index.
+  uint64_t start_bit = (first_sequential_zone * zone_size) / bstore->min_alloc_size;
+  uint64_t pos = start_bit ? used_blocks.find_next(start_bit - 1)
+			   : used_blocks.find_first();
 
   uint64_t zone_dead = 0;
   for (uint32_t zone = first_sequential_zone;
