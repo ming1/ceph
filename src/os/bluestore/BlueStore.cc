@@ -3347,7 +3347,12 @@ int BlueStore::_set_main_bdev_label()
   label.size = size;
   label.btime = ceph_clock_now();
   label.description = "main";
-  if (cct->_conf.get_val<bool>("bluestore_bdev_label_multi")) {
+  // Multiple bdev label copies live at fixed offsets across the device
+  // (1G, 10G, ...).  On zoned/SMR devices those offsets fall in
+  // sequential-write-required zones, so keep a single label in the
+  // conventional region instead.
+  if (cct->_conf.get_val<bool>("bluestore_bdev_label_multi") &&
+      !bdev->is_smr()) {
     label.meta["multi"] = "yes";
     label.meta["epoch"] = "1";
     bdev_label_multi = true;
@@ -4625,6 +4630,13 @@ int BlueStore::_prepare_db_environment(bool create, bool read_only,
     return -EIO;
   }
 
+  // A zoned/SMR device always uses the zoned freelist; make sure that is
+  // reflected before registering merge operators so the zone-state merge
+  // operator (prefix "z") is installed at db-open time (the persisted
+  // freelist_type is only loaded later in _open_super_meta()).
+  if (bdev->is_smr()) {
+    freelist_type = "zoned";
+  }
   FreelistManager::setup_merge_operators(db, freelist_type);
   db->set_merge_operator(PREFIX_STAT, merge_op);
   db->set_cache_size(cache_kv_ratio * cache_size);
@@ -5181,7 +5193,8 @@ int BlueStore::mkfs()
   alloc->init_rm_free(BDEV_FIRST_LABEL_POSITION, reserved);
 
   // take possible bdev locations, so it will not be used
-  if (cct->_conf.get_val<bool>("bluestore_bdev_label_multi")) {
+  if (cct->_conf.get_val<bool>("bluestore_bdev_label_multi") &&
+      !bdev->is_smr()) {
     // take space for other bdev label copies
     for (size_t i = 1; i < bdev_label_positions.size(); i++) {
       uint64_t location = bdev_label_positions[i];

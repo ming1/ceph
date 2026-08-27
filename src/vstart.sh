@@ -949,12 +949,14 @@ EOF
             fi
         fi
         if [ "$zoned_enabled" -eq 1 ]; then
+            # zoned/SMR mode (allocator + freelist) is auto-selected from the
+            # device via BlockDevice::is_smr(); the conventional region keeps a
+            # regular allocator, so do not force "bluestore allocator = zoned".
             BLUESTORE_OPTS+="
         bluestore min alloc size = 65536
         bluestore prefer deferred size = 0
         bluestore prefer deferred size hdd = 0
-        bluestore prefer deferred size ssd = 0
-        bluestore allocator = zoned"
+        bluestore prefer deferred size ssd = 0"
         fi
         if [ "$io_uring_enabled" -eq 1 ]; then
             BLUESTORE_OPTS+="

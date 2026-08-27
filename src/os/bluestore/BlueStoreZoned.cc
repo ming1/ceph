@@ -47,14 +47,22 @@ using ceph::encode;
 
 int BlueStoreZoned::create_shared_alloc(uint64_t alloc_size)
 {
+  // The conventional region of a zoned device is randomly writable and
+  // hosts BlueFS/metadata, so it must use a regular allocator -- never the
+  // sequential-only "zoned" allocator (which would hand out the reserved
+  // bdev label/superblock region at offset 0).
+  std::string conventional_allocator_type = bstore->cct->_conf->bluestore_allocator;
+  if (conventional_allocator_type == "zoned") {
+    conventional_allocator_type = "hybrid";
+  }
   Allocator *a = Allocator::create(
-    bstore->cct, bstore->cct->_conf->bluestore_allocator,
+    bstore->cct, conventional_allocator_type,
     bstore->bdev->get_conventional_region_size(),
     alloc_size,
     zone_size, 0,
     "zoned_block");
   if (!a) {
-    lderr(bstore->cct) << __func__ << " failed to create " << bstore->cct->_conf->bluestore_allocator
+    lderr(bstore->cct) << __func__ << " failed to create " << conventional_allocator_type
 	       << " allocator" << dendl;
     delete bstore->alloc;
     return -EINVAL;
