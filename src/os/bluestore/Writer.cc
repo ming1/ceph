@@ -20,6 +20,13 @@
 #include "BlueStore_inlines.h"
 #include "Allocator.h"
 
+bool BlueStore::Writer::_is_smr() const
+{
+  // unittest_bluestore_types drives the Writer on a BlueStore that has
+  // no block device
+  return bstore->bdev && bstore->bdev->is_smr();
+}
+
 std::ostream& operator<<(std::ostream& out, const BlueStore::Writer::blob_data_printer& printer)
 {
   out << std::hex;
@@ -412,9 +419,28 @@ BlueStore::BlobRef BlueStore::Writer::_blob_create_with_data(
     << " alloc_offset=" << alloc_offset
     << " -> " << blob->print(pp_mode) << dendl;
   PExtentVector& disk_extents = blob_allocs;
-  _crop_allocs_to_io(disk_extents, in_blob_offset - alloc_offset,
-    blob_length - in_blob_offset - disk_data.length());
-  _schedule_io(disk_extents, disk_data);
+  if (_is_smr()) {
+    // Sequential zones: the entire allocated AU range must be written so the
+    // device write pointer advances by exactly the allocation.  Instead of
+    // cropping the I/O to just the data, write the whole [alloc_offset,
+    // blob_length) range, zero-padding around the data.  The padding falls in
+    // the blob's unused/unref'd region, so it is never read back.
+    uint32_t front = in_blob_offset - alloc_offset;
+    uint32_t back = blob_length - in_blob_offset - data_length;
+    bufferlist padded;
+    if (front) {
+      padded.append_zero(front);
+    }
+    padded.append(disk_data);
+    if (back) {
+      padded.append_zero(back);
+    }
+    _schedule_io(disk_extents, padded);
+  } else {
+    _crop_allocs_to_io(disk_extents, in_blob_offset - alloc_offset,
+      blob_length - in_blob_offset - disk_data.length());
+    _schedule_io(disk_extents, disk_data);
+  }
   bblob.mark_used(in_blob_offset, data_length);
   return blob;
 }
@@ -996,6 +1022,12 @@ void BlueStore::Writer::_do_put_blobs(
   uint32_t au_size = bstore->min_alloc_size;
   uint32_t blob_size = wctx->target_blob_size;
   auto bd_it = bd.begin();
+  if (_is_smr()) {
+    // Sequential zones: never expand/append into an existing blob in place;
+    // emit all data as fresh blobs allocated at the zone write pointer.
+    _do_put_new_blobs(logical_offset, ref_end_offset, bd_it, bd.end());
+    return;
+  }
   exmp_it to_it;
   uint32_t left_bound = p2align(logical_offset, blob_size);
   uint32_t right_bound = p2roundup(logical_offset, blob_size);
@@ -1085,6 +1117,13 @@ std::pair<bool, uint32_t> BlueStore::Writer::_write_expand_l(
   uint32_t off_stop = p2align<uint32_t>(logical_offset, bstore->min_alloc_size);
   // no need to go earlier then one AU
   ceph_assert(off_stop != logical_offset); // to prevent superfluous invocation
+  if (_is_smr()) {
+    // Sequential zones: the whole allocated AU must be written so the device
+    // write pointer advances by exactly the allocation.  Read the head back
+    // so live bytes of this object in the AU survive; _read_self() returns
+    // zeros for holes.
+    return std::make_pair(false, off_stop);
+  }
   uint32_t min_off = p2align(logical_offset, block_size);
   uint32_t new_data_off = min_off;
   bool     new_data_pad = true; // unless otherwise stated, we pad
@@ -1156,6 +1195,13 @@ std::pair<bool, uint32_t> BlueStore::Writer::_write_expand_r(
   uint32_t end_stop = p2roundup<uint32_t>(end_offset, bstore->min_alloc_size);
   // no need to go further then one AU, since new blob it if happens can allocate one AU
   ceph_assert(end_stop != end_offset); // to prevent superfluous invocation
+  if (_is_smr()) {
+    // Sequential zones: read the tail back out to the AU boundary so the
+    // whole allocated AU is written without dropping live bytes;
+    // _read_self() returns zeros for holes and past the object end
+    // (see _write_expand_l).
+    return std::make_pair(false, end_stop);
+  }
   uint32_t min_end = p2roundup(end_offset, block_size);
   uint32_t new_data_end = min_end;
   bool     new_data_pad = true; // unless otherwise stated, we pad
@@ -1357,7 +1403,11 @@ void BlueStore::Writer::do_write_with_blobs(
   ceph_assert(pos == data_end);
 
   uint32_t au_size = bstore->min_alloc_size;
-  if (au_size != bstore->block_size) {
+  // On sequential-write-required (zoned/SMR) devices we must never write into
+  // already-allocated space in place; every write has to append fresh blobs at
+  // the zone write pointer.  Skip the allocated-space reuse so all data flows
+  // through _do_put_new_blobs() below.
+  if (au_size != bstore->block_size && !_is_smr()) {
     _try_put_data_on_allocated(location, data_end, ref_end, bd, after_punch_it);
   }
   if (location != data_end) {
@@ -1423,6 +1473,11 @@ void BlueStore::Writer::_collect_released_allocated()
   for (auto e : allocated) {
     txc->allocated.insert(e.offset, e.length);
   }
+  // Hand the extents to the saved copies (O(1) swap) instead of just clearing,
+  // so get_released()/get_allocated() can report them after the write (used by
+  // the zoned write path to maintain per-zone cleaner references).
+  saved_released.swap(released);
+  saved_allocated.swap(allocated);
   released.clear();
   allocated.clear();
 }

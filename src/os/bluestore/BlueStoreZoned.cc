@@ -927,6 +927,63 @@ void BlueStoreZoned::wctx_drop_refs(
   }
 }
 
+void BlueStoreZoned::update_zone_refs(TransContext *txc, OnodeRef& o,
+				       const PExtentVector& allocated,
+				       const PExtentVector& released)
+{
+  // Maintain the onode's per-zone cleaner references (PREFIX_ZONED_CL_INFO).
+  // The classic write path keeps these up to date incrementally in
+  // _wctx_finish(); the v2 write path does not, so do the same work here driven
+  // by the physical extents this write allocated and released -- so the cost is
+  // O(write), not O(object) as a full extent-map rescan would be.
+
+  // A newly written extent gives this onode a reference to its zone.
+  for (const auto& e : allocated) {
+    if (!e.is_valid()) {
+      continue;
+    }
+    uint32_t zone = e.offset / zone_size;
+    if (!o->onode.zone_offset_refs.count(zone)) {
+      dout(20) << __func__ << " add ref zone 0x" << std::hex << zone
+	       << " offset 0x" << (e.offset % zone_size) << std::dec << dendl;
+      txc->note_write_zone_offset(o, zone, e.offset % zone_size);
+    }
+  }
+
+  // A released extent may have been this onode's last reference to its zone.
+  // Collect such candidate zones, then drop the ref for any the onode no longer
+  // references anywhere.  Only when there is something to check do we fault the
+  // extent map (mirrors _wctx_finish), and we stop early once all candidates
+  // are accounted for.
+  std::set<uint32_t> candidates;
+  for (const auto& e : released) {
+    if (e.is_valid()) {
+      uint32_t zone = e.offset / zone_size;
+      if (o->onode.zone_offset_refs.count(zone)) {
+	candidates.insert(zone);
+      }
+    }
+  }
+  if (candidates.empty()) {
+    return;
+  }
+  o->extent_map.fault_range(bstore->db, 0, BlueStore::OBJECT_MAX_SIZE);
+  for (auto& ex : o->extent_map.extent_map) {
+    for (auto& pe : ex.blob->get_blob().get_extents()) {
+      if (pe.is_valid()) {
+	candidates.erase(pe.offset / zone_size);
+      }
+    }
+    if (candidates.empty()) {
+      break;
+    }
+  }
+  for (uint32_t zone : candidates) {
+    dout(20) << __func__ << " rm ref zone 0x" << std::hex << zone << std::dec << dendl;
+    txc->note_release_zone_offset(o, zone, o->onode.zone_offset_refs[zone]);
+  }
+}
+
 void BlueStoreZoned::clone_range_refs(
   TransContext *txc,
   OnodeRef& newo,
