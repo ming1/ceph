@@ -100,7 +100,11 @@ int BlueStoreZoned::init_alloc(std::map<uint64_t, uint64_t> *zone_adjustments)
 	       << " device write pointer 0x" << p
 	       << " > bluestore pointer 0x" << zones[i].write_pointer
 	       << ", advancing 0x" << delta << std::dec << dendl;
-      (*zone_adjustments)[zones[i].write_pointer] = delta;
+      // Key by the absolute device offset so _post_init_alloc's
+      // FreelistManager::allocate() (which derives the zone from
+      // offset / zone_size) updates *this* zone.  Keying by the zone-relative
+      // write pointer would route every adjustment to zone 0.
+      (*zone_adjustments)[i * zone_size + zones[i].write_pointer] = delta;
       zones[i].num_dead_bytes += delta;
       zones[i].write_pointer = p;
     }
