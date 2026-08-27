@@ -5569,6 +5569,7 @@ options:
   - btree
   - hybrid
   - hybrid_btree2
+  - zoned
   with_legacy: true
 - name: bluestore_freelist_blocks_per_key
   type: size
@@ -7284,6 +7285,7 @@ options:
   enum_values:
   - aio
   - spdk
+  - hm_smr
 - name: bdev_stalled_read_warn_lifetime
   type: uint
   level: advanced

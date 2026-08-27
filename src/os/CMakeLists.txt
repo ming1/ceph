@@ -17,6 +17,12 @@ if(WITH_BLUESTORE)
     PRIVATE bluestore)
 endif()
 
+if(WITH_ZBD)
+  list(APPEND libos_srcs
+    bluestore/ZonedFreelistManager.cc
+    bluestore/ZonedAllocator.cc)
+endif()
+
 if(WITH_FUSE)
   add_library(fusestore
     FuseStore.cc)

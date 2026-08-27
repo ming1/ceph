@@ -43,6 +43,8 @@ Allocator *Allocator::create(
   std::string_view type,
   int64_t size,
   int64_t block_size,
+  int64_t zone_size,
+  int64_t first_sequential_zone,
   std::string_view name)
 {
   Allocator* alloc = nullptr;
@@ -63,6 +65,11 @@ Allocator *Allocator::create(
       cct->_conf.get_val<uint64_t>("bluestore_hybrid_alloc_mem_cap"),
       cct->_conf.get_val<double>("bluestore_btree2_alloc_weight_factor"),
       name);
+#ifdef HAVE_LIBZBD
+  } else if (type == "zoned") {
+    return new ZonedAllocator(cct, size, block_size, zone_size, first_sequential_zone,
+			      name);
+#endif
   }
   if (alloc == nullptr) {
     lderr(cct) << "Allocator::" << __func__ << " unknown alloc type "
