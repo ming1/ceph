@@ -12,6 +12,7 @@
 #define CEPH_OS_BLUESTORE_ZONEDALLOCATOR_H
 
 #include <mutex>
+#include <set>
 
 #include "AllocatorBase.h"
 #include "common/ceph_mutex.h"
@@ -40,6 +41,12 @@ class ZonedAllocator : public AllocatorBase {
   uint64_t num_zones;
   std::atomic<uint32_t> cleaning_zone = -1;
   std::vector<zone_state_t> zone_states;
+  // Zones the cleaner failed to fully evacuate (residual live bytes it could
+  // not relocate).  Excluded from future cleaning so the cleaner does not
+  // live-lock re-selecting the same un-cleanable zone.  Cleared when the zone
+  // is reset, when more space is released in it, or when the cleaner looks
+  // for a zone and this one has no live bytes.
+  std::set<uint32_t> non_cleanable_zones;
 
   inline uint64_t get_offset(uint64_t zone_num) const {
     return zone_num * zone_size + get_write_pointer(zone_num);
@@ -103,6 +110,12 @@ public:
     free_extent_vector_t* out) override;
 
   int64_t pick_zone_to_clean(float min_score, uint64_t min_saved);
+  // Mark a zone the cleaner could not fully evacuate so it is not re-selected
+  // (avoids a cleaner live-lock that would otherwise spin and flood the log).
+  void mark_zone_non_cleanable(uint32_t zone) {
+    std::scoped_lock l(lock);
+    non_cleanable_zones.insert(zone);
+  }
   // True once free space drops below the over-provisioning threshold; used to
   // gate the cleaner so garbage collection only runs under space pressure
   // (and not wastefully on a mostly-empty device).

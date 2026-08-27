@@ -513,13 +513,16 @@ void BlueStoreZoned::clean_zone(
   // The drain waits until the transactions have left their sequencers.  The
   // extents a transaction freed go back to the allocator, which raises the
   // dead bytes of the zone, a moment after that.  So live bytes here are
-  // either data that could not be moved, or a release that is not counted
-  // yet.  In the second case the cleaner picks the zone again, and resets it
-  // then.
-  if (a->get_live_bytes(zone) > 0) {
-    derr << "zone 0x" << std::hex << zone << " still has 0x" << a->get_live_bytes(zone)
-	 << " live bytes" << std::dec << dendl;
-    // should we do something else here to avoid a live-lock in the event of a problem?
+  // either data that could not be moved (e.g. live data with no reachable
+  // zone ref), or a release that is not counted yet.
+  //
+  // Both get the mark, so that the cleaner does not pick the same zone for
+  // ever.  A zone that was emptied is picked again once its last release is
+  // counted, see ZonedAllocator::pick_zone_to_clean(), and is reset then.
+  if (uint64_t live = a->get_live_bytes(zone); live > 0) {
+    dout(10) << __func__ << " zone 0x" << std::hex << zone << " still has 0x"
+	     << live << " live bytes" << std::dec << dendl;
+    a->mark_zone_non_cleanable(zone);
     return;
   }
 
