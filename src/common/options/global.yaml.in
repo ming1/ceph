@@ -7329,6 +7329,20 @@ options:
   desc: How long the BlueStore cleaner should sleep before re-checking utilization
   default: 5
   with_legacy: true
+- name: bluestore_zoned_cleaner_min_free_ratio
+  type: float
+  level: advanced
+  desc: Free-space ratio below which the zoned (SMR/ZNS) cleaner starts garbage
+    collecting
+  long_desc: The zoned cleaner only relocates live data and reclaims zones once the
+    fraction of free sequential space drops below this ratio; above it the abundant
+    free space is used as over-provisioning, avoiding write amplification that would
+    steal device bandwidth from client writes. Lower values delay GC (more
+    over-provisioning, less write amplification); higher values start GC sooner.
+  default: 0.25
+  min: 0
+  max: 1
+  with_legacy: true
 - name: bluestore_onode_segment_size
   type: size
   level: advanced
