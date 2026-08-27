@@ -44,6 +44,7 @@ Allocator *Allocator::create(
   int64_t size,
   int64_t block_size,
   int64_t zone_size,
+  int64_t zone_capacity,
   int64_t first_sequential_zone,
   std::string_view name)
 {
@@ -67,8 +68,8 @@ Allocator *Allocator::create(
       name);
 #ifdef HAVE_LIBZBD
   } else if (type == "zoned") {
-    return new ZonedAllocator(cct, size, block_size, zone_size, first_sequential_zone,
-			      name);
+    return new ZonedAllocator(cct, size, block_size, zone_size, zone_capacity,
+			      first_sequential_zone, name);
 #endif
   }
   if (alloc == nullptr) {

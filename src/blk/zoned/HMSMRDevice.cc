@@ -45,7 +45,8 @@ int HMSMRDevice::_post_open()
 {
   dout(10) << __func__ << dendl;
 
-  zbd_fd = zbd_open(path.c_str(), O_RDWR | O_DIRECT | O_LARGEFILE, nullptr);
+  struct zbd_info info;
+  zbd_fd = zbd_open(path.c_str(), O_RDWR | O_DIRECT | O_LARGEFILE, &info);
   int r;
   if (zbd_fd < 0) {
     r = errno;
@@ -56,6 +57,9 @@ int HMSMRDevice::_post_open()
 
   unsigned int nr_zones = 0;
   std::vector<zbd_zone> zones;
+  // Reusable single-zone report buffer.
+  unsigned int nr = 1;
+  std::vector<zbd_zone> z(1);
   if (zbd_report_nr_zones(zbd_fd, 0, 0, ZBD_RO_NOT_WP, &nr_zones) != 0) {
     r = -errno;
     derr << __func__ << " zbd_report_nr_zones failed on " << path << ": "
@@ -73,7 +77,42 @@ int HMSMRDevice::_post_open()
   zone_size = zbd_zone_len(&zones[0]);
   conventional_region_size = nr_zones * zone_size;
 
+  // Determine the usable capacity of a sequential zone.  On HM-SMR drives the
+  // capacity equals the zone size; ZNS SSDs may report a smaller capacity,
+  // leaving an unwritable gap at the end of every sequential zone.  We read it
+  // from the first zone at/after the conventional region (capacity is uniform
+  // across sequential zones on every device we support).
+  if (conventional_region_size / zone_size >= info.nr_zones) {
+    // No sequential zone, so nothing uses the capacity.
+    zone_capacity = zone_size;
+  } else {
+    // The capacity is stored at mkfs and decides what can be allocated: do
+    // not guess it when the device does not tell.
+    nr = 1;
+    if (zbd_report_zones(zbd_fd, conventional_region_size, zone_size,
+			 ZBD_RO_ALL, z.data(), &nr) != 0) {
+      r = -errno;
+      derr << __func__ << " zbd_report_zones failed on " << path << ": "
+	   << cpp_strerror(r) << dendl;
+      goto fail;
+    }
+    if (nr < 1) {
+      r = -EINVAL;
+      derr << __func__ << " " << path << " reports no zone at offset "
+	   << conventional_region_size << dendl;
+      goto fail;
+    }
+    zone_capacity = zbd_zone_capacity(&z[0]);
+    if (zone_capacity == 0 || zone_capacity > zone_size) {
+      r = -EINVAL;
+      derr << __func__ << " " << path << " reports a zone capacity of "
+	   << zone_capacity << " for a zone size of " << zone_size << dendl;
+      goto fail;
+    }
+  }
+
   dout(10) << __func__ << " setting zone size to " << zone_size
+	   << ", zone capacity to " << zone_capacity
 	   << " and conventional region size to " << conventional_region_size
            << dendl;
 

@@ -30,6 +30,7 @@ class ZonedFreelistManager : public FreelistManager {
   uint64_t size;	      ///< size of sequential region (bytes)
   uint64_t bytes_per_block;   ///< bytes per allocation unit (bytes)
   uint64_t zone_size;	      ///< size of a single zone (bytes)
+  uint64_t zone_capacity;     ///< usable bytes per zone (<= zone_size on ZNS)
   uint64_t num_zones;	      ///< number of sequential zones
   uint64_t starting_zone_num; ///< the first sequential zone number
 
@@ -65,6 +66,7 @@ public:
   int create(uint64_t size,
 	     uint64_t granularity,
 	     uint64_t zone_size,
+	     uint64_t zone_capacity,
 	     uint64_t first_sequential_zone,
 	     KeyValueDB::Transaction txn) override;
 
