@@ -2307,7 +2307,7 @@ TEST(BlueFS, truncate_drops_allocations) {
     shared_alloc.set(
       Allocator::create(g_ceph_context, g_ceph_context->_conf->bluefs_allocator,
                         s.slow_size ? s.slow_size : s.db_size,
-                        shared_alloc_unit, "test shared allocator"),
+                        shared_alloc_unit, 0, 0, "test shared allocator"),
       shared_alloc_unit);
     shared_alloc.a->init_add_free(0, s.slow_size ? s.slow_size : s.db_size);
 
@@ -2379,7 +2379,7 @@ TEST(BlueFS, truncate_unused_allocations) {
     bluefs_shared_alloc_context_t shared_alloc;
     shared_alloc.set(
       Allocator::create(g_ceph_context, g_ceph_context->_conf->bluefs_allocator,
-                        db_size, alloc_unit, "test shared allocator"),
+                        db_size, alloc_unit, 0, 0, "test shared allocator"),
       alloc_unit);
     shared_alloc.a->init_add_free(0, db_size);
 
