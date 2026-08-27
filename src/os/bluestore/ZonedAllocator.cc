@@ -219,7 +219,9 @@ void ZonedAllocator::init_from_zone_pointers(
   zone_states = std::move(_zone_states);
   num_sequential_free = 0;
   for (size_t i = first_seq_zone_num; i < num_zones; ++i) {
-    num_sequential_free += zone_size - (zone_states[i].write_pointer % zone_size);
+    // The write pointer is relative to the start of the zone and never exceeds
+    // the zone size, so the free space is zone_size - write_pointer.
+    num_sequential_free += zone_size - zone_states[i].write_pointer;
   }
   ldout(cct, 10) << "free 0x" << std::hex << num_sequential_free
 		 << " / 0x" << sequential_size << std::dec
