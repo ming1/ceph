@@ -525,7 +525,11 @@ void BlueStoreZoned::clean_zone(
   if (a->get_live_bytes(zone) > 0) {
     derr << "zone 0x" << std::hex << zone << " still has 0x" << a->get_live_bytes(zone)
 	 << " live bytes" << std::dec << dendl;
-    // should we do something else here to avoid a live-lock in the event of a problem?
+    // Could not fully evacuate the zone (e.g. live data with no reachable zone
+    // ref).  Exclude it from future cleaning so the cleaner does not re-select
+    // the same zone forever -- that live-lock spins the cleaner and floods the
+    // log with this message.
+    a->mark_zone_non_cleanable(zone);
     return;
   }
 
