@@ -432,11 +432,25 @@ void BlueStoreZoned::cleaner_thread()
   auto f = dynamic_cast<ZonedFreelistManager*>(bstore->fm);
   ceph_assert(f);
   while (true) {
-    // thresholds to trigger cleaning
-    // FIXME
-    float min_score = .05;                // score: bytes saved / bytes moved
-    uint64_t min_saved = zone_size / 32;  // min bytes saved to consider cleaning
-    auto zone_to_clean = a->pick_zone_to_clean(min_score, min_saved);
+    // Exit promptly on shutdown, even when there is always a zone to clean
+    // (otherwise the loop below would keep cleaning and never observe the stop
+    // request, hanging umount).
+    if (zoned_cleaner_stop) {
+      break;
+    }
+
+    // Only garbage-collect under space pressure.  Otherwise the cleaner would
+    // relocate still-live data on a mostly-empty device (huge write
+    // amplification that steals device bandwidth from client writes) instead
+    // of using the abundant free space as over-provisioning.
+    int64_t zone_to_clean = -1;
+    if (a->low_on_space()) {
+      // thresholds to trigger cleaning
+      // FIXME: fixed values, they should be options
+      float min_score = .05;                // score: bytes saved / bytes moved
+      uint64_t min_saved = zone_size / 32;  // min bytes saved to consider cleaning
+      zone_to_clean = a->pick_zone_to_clean(min_score, min_saved);
+    }
     if (zone_to_clean < 0) {
       if (zoned_cleaner_stop) {
 	break;

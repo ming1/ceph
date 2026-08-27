@@ -103,6 +103,10 @@ public:
     free_extent_vector_t* out) override;
 
   int64_t pick_zone_to_clean(float min_score, uint64_t min_saved);
+  // True once free space drops below the over-provisioning threshold; used to
+  // gate the cleaner so garbage collection only runs under space pressure
+  // (and not wastefully on a mostly-empty device).
+  bool low_on_space(void);
   void set_cleaning_zone(uint32_t zone) {
     cleaning_zone = zone;
   }
@@ -117,9 +121,6 @@ public:
   void init_rm_free(uint64_t offset, uint64_t length) override {}
 
   void shutdown() override;
-
-private:
-  bool low_on_space(void);
 };
 
 #endif

@@ -260,8 +260,7 @@ bool ZonedAllocator::low_on_space(void)
 		 << ", free ratio is " << free_ratio << dendl;
   ceph_assert(num_sequential_free <= (int64_t)sequential_size);
 
-  // TODO: make 0.25 tunable
-  return free_ratio <= 0.25;
+  return free_ratio <= cct->_conf->bluestore_zoned_cleaner_min_free_ratio;
 }
 
 void ZonedAllocator::shutdown()
