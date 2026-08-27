@@ -163,6 +163,10 @@ public:
     TransContext *txc,
     OnodeRef& o,
     std::set<uint32_t>& zones_with_releases);
+  void update_zone_refs(
+    TransContext *txc, OnodeRef& o,
+    const PExtentVector& allocated,
+    const PExtentVector& released);
   void clone_range_refs(
     TransContext *txc,
     OnodeRef& newo,
@@ -334,6 +338,13 @@ inline void BlueStoreZoned::wctx_drop_refs(
   TransContext *txc,
   OnodeRef& o,
   std::set<uint32_t>& zones_with_releases)
+{
+  BLUESTORE_ZONED_STUB;
+}
+
+inline void BlueStoreZoned::update_zone_refs(TransContext *txc, OnodeRef& o,
+				       const PExtentVector& allocated,
+				       const PExtentVector& released)
 {
   BLUESTORE_ZONED_STUB;
 }

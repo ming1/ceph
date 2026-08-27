@@ -2317,7 +2317,6 @@ private:
     OnodeRef& o,
     WriteContext *wctx,
     std::set<SharedBlob*> *maybe_unshared_blobs=0);
-
   int _write(TransContext *txc,
 	     CollectionRef& c,
 	     OnodeRef& o,
@@ -2366,7 +2365,9 @@ private:
     WriteContext& wctx,
     uint32_t offset, uint32_t length,
     ceph::buffer::list& bl,
-    uint32_t scan_left, uint32_t scan_right);
+    uint32_t scan_left, uint32_t scan_right,
+    PExtentVector* zoned_allocated = nullptr,
+    PExtentVector* zoned_released = nullptr);
   int _touch(TransContext *txc,
 	     CollectionRef& c,
 	     OnodeRef& o);
