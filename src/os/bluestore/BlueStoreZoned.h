@@ -120,11 +120,13 @@ public:
   int create_shared_alloc(uint64_t alloc_size);
   int init_alloc(std::map<uint64_t, uint64_t> *zone_adjustments);
   void post_init_alloc(const std::map<uint64_t, uint64_t>& zone_adjustments);
-  /// mkfs: read the zone layout of the device and reset the zones (unless
-  /// bluestore_assume_clean_zones is set)
-  void mkfs_prepare();
-  /// mkfs: give BlueFS the conventional region
-  void mkfs_init_main_device(uint64_t reserved);
+  /// mkfs: read the zone layout of the device, reset the zones (unless
+  /// bluestore_assume_clean_zones is set) and check that a device with no
+  /// conventional zones has a block.db
+  int mkfs_prepare();
+  /// mkfs: give BlueFS the conventional region, or on a device with none
+  /// write the label into the first zone and pad the reserved space
+  int mkfs_init_main_device(uint64_t reserved);
   void mkfs_super(KeyValueDB::Transaction& t);
   void fsck_note_blob(
     const bluestore_blob_t& blob,
@@ -223,12 +225,12 @@ inline void BlueStoreZoned::post_init_alloc(const std::map<uint64_t, uint64_t>& 
   BLUESTORE_ZONED_STUB;
 }
 
-inline void BlueStoreZoned::mkfs_prepare()
+inline int BlueStoreZoned::mkfs_prepare()
 {
   BLUESTORE_ZONED_STUB;
 }
 
-inline void BlueStoreZoned::mkfs_init_main_device(uint64_t reserved)
+inline int BlueStoreZoned::mkfs_init_main_device(uint64_t reserved)
 {
   BLUESTORE_ZONED_STUB;
 }

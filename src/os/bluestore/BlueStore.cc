@@ -2424,6 +2424,12 @@ int BlueStore::write_meta(const std::string& key, const std::string& value)
     // skip bdev label section if not supported
     return ObjectStore::write_meta(key, value);
   }
+  if (bdev->is_smr() && bdev->get_conventional_region_size() == 0) {
+    // Pure ZNS: the on-device bdev label lives in a sequential zone and cannot
+    // be rewritten in place after mkfs, so do not store meta key/values in it.
+    // The OSD directory copy (written below) is authoritative; see read_meta().
+    return ObjectStore::write_meta(key, value);
+  }
   string p = path + "/block";
   if (bdev_label_valid_locations.empty()) {
     _read_multi_bdev_label(cct, bdev, p, fsid, &bdev_label, &bdev_label_valid_locations,
@@ -2461,6 +2467,11 @@ int BlueStore::read_meta(const std::string& key, std::string *value)
   }
   if (!local_bdev || !local_bdev->supported_bdev_label()) {
     // skip bdev label section if not supported
+    return ObjectStore::read_meta(key, value);
+  }
+  if (local_bdev->is_smr() && local_bdev->get_conventional_region_size() == 0) {
+    // Pure ZNS: meta key/values are not stored in the on-device label (see
+    // write_meta()); read them from the authoritative OSD directory copy.
     return ObjectStore::read_meta(key, value);
   }
   string p = path + "/block";
@@ -3515,7 +3526,13 @@ int BlueStore::_open_bdev(bool create)
     goto fail;
 
   if (create &&
-      cct->_conf.get_val<bool>("bluestore_discard_on_mkfs")) {
+      cct->_conf.get_val<bool>("bluestore_discard_on_mkfs")
+      // Discard (BLKDISCARD) is invalid on sequential-write-required zones and
+      // fails asynchronously (surfacing later as an fdatasync EIO).  On zoned
+      // devices the equivalent of trimming is a zone reset, which mkfs() does
+      // via reset_all_zones(), so skip the whole-device discard here.
+      && !bdev->is_smr()
+      ) {
     interval_set<uint64_t> whole_device;
     dout(5) << __func__ << " trimming device:" << p << dendl;
     whole_device.insert(0, bdev->get_size());
@@ -3553,7 +3570,16 @@ int BlueStore::_open_bdev(bool create)
 
   if (bdev->supported_bdev_label()) {
     if (create) {
-      r = _set_main_bdev_label();
+      // On a pure-ZNS device the bdev label lives in a sequential zone that
+      // must be reset before it can be written.  Defer the label write to
+      // mkfs(), which writes it after reset_all_zones().
+      if (bdev->is_smr() && bdev->get_conventional_region_size() == 0) {
+        dout(10) << __func__ << " deferring pure-ZNS bdev label write to mkfs"
+                 << dendl;
+      } else
+      {
+        r = _set_main_bdev_label();
+      }
     } else {
       r = _check_main_bdev_label();
     }
@@ -4197,9 +4223,23 @@ int BlueStore::_open_bluefs(bool create, bool read_only)
     return r;
   }
   BlueFSVolumeSelector* vselector = nullptr;
+  bool fit_to_fast =
+    cct->_conf->bluestore_volume_selection_policy == "fit_to_fast";
+  // A zoned main device with no conventional region cannot hold any BlueFS
+  // data.  Its BlueFS allocator therefore has zero capacity, so a level-based
+  // volume selector that offers RocksDB a ".slow" path eventually places an
+  // SST there, BlueFS fails the allocation with -ENOSPC and BlueRocksEnv turns
+  // that into ceph_abort_msg("unrecognized error code").  Confine RocksDB to
+  // the fast (db) device instead: FitToFastVolumeSelector exposes a single
+  // path.
+  if (bdev->is_smr() && bdev->get_conventional_region_size() == 0) {
+    dout(10) << __func__ << " pure-ZNS main device, confining BlueFS to the db"
+             << " device (fit_to_fast volume selection)" << dendl;
+    fit_to_fast = true;
+  }
   if (bluefs_layout.shared_bdev == BlueFS::BDEV_SLOW ||
       cct->_conf->bluestore_volume_selection_policy == "use_some_extra_enforced" ||
-      cct->_conf->bluestore_volume_selection_policy == "fit_to_fast") {
+      fit_to_fast) {
 
     string options = cct->_conf->bluestore_rocksdb_options;
     string options_annex = cct->_conf->bluestore_rocksdb_options_annex;
@@ -4220,7 +4260,7 @@ int BlueStore::_open_bluefs(bool create, bool read_only)
     if (r < 0) {
       return r;
     }
-    if (cct->_conf->bluestore_volume_selection_policy == "fit_to_fast") {
+    if (fit_to_fast) {
       vselector = new FitToFastVolumeSelector(
         bluefs->get_block_device_size(BlueFS::BDEV_WAL) * 95 / 100,
         bluefs->get_block_device_size(BlueFS::BDEV_DB) * 95 / 100,
@@ -5145,7 +5185,9 @@ int BlueStore::mkfs()
   // choose freelist manager
   if (bdev->is_smr()) {
     freelist_type = "zoned";
-    zoned.mkfs_prepare();
+    r = zoned.mkfs_prepare();
+    if (r < 0)
+      goto out_close_bdev;
   } else
   {
     freelist_type = "bitmap";
@@ -5203,7 +5245,9 @@ int BlueStore::mkfs()
     }
   }
   if (bdev->is_smr()) {
-    zoned.mkfs_init_main_device(reserved);
+    r = zoned.mkfs_init_main_device(reserved);
+    if (r < 0)
+      goto out_close_alloc;
   }
 
   r = _open_db(true);
