@@ -101,8 +101,14 @@ public:
     return bytes_per_block;
   }
 
+  // Zoned devices cannot be grown in place: the zone layout and the per-zone
+  // state in the DB are fixed at mkfs time.
+  int expand(uint64_t new_size, KeyValueDB* db) override;
+
   void get_meta(uint64_t target_size,
 		std::vector<std::pair<std::string, std::string>>*) const override;
+
+  bool validate(uint64_t min_alloc_size) const override;
 
   std::vector<zone_state_t> get_zone_states(KeyValueDB *kvdb) const;
 
