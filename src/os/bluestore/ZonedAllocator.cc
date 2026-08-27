@@ -240,7 +240,12 @@ int64_t ZonedAllocator::pick_zone_to_clean(float min_score, uint64_t min_saved)
   std::lock_guard l(lock);
   int32_t best = -1;
   float best_score = 0.0;
-  for (size_t i = first_seq_zone_num; i < num_zones; ++i) {
+  // On a pure-ZNS device the sequential region starts at device offset 0, so
+  // the first sequential zone (zone 0) holds the bdev label + reserved region.
+  // That data can never be evacuated, so the zone can never be reset -- never
+  // select it for cleaning (otherwise the cleaner busy-loops on it).
+  size_t first_cleanable = first_seq_zone_num == 0 ? 1 : first_seq_zone_num;
+  for (size_t i = first_cleanable; i < num_zones; ++i) {
     // value (score) = benefit / cost
     //    benefit = how much net free space we'll get (dead bytes)
     //    cost = how many bytes we'll have to rewrite (live bytes)

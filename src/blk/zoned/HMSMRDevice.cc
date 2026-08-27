@@ -55,27 +55,38 @@ int HMSMRDevice::_post_open()
     return -r;
   }
 
-  unsigned int nr_zones = 0;
-  std::vector<zbd_zone> zones;
+  // Number of conventional (randomly-writable) zones.  These always form a
+  // prefix of the device's LBA space and define the conventional region.  A
+  // pure ZNS device has none, so we must not assume one exists.
+  unsigned int nr_conv_zones = 0;
   // Reusable single-zone report buffer.
   unsigned int nr = 1;
   std::vector<zbd_zone> z(1);
-  if (zbd_report_nr_zones(zbd_fd, 0, 0, ZBD_RO_NOT_WP, &nr_zones) != 0) {
+  if (zbd_report_nr_zones(zbd_fd, 0, 0, ZBD_RO_NOT_WP, &nr_conv_zones) != 0) {
     r = -errno;
     derr << __func__ << " zbd_report_nr_zones failed on " << path << ": "
 	 << cpp_strerror(r) << dendl;
     goto fail;
   }
 
-  zones.resize(nr_zones);
-  if (zbd_report_zones(zbd_fd, 0, 0, ZBD_RO_NOT_WP, zones.data(), &nr_zones) != 0) {
+  // Read the first zone (of any type) to determine the (uniform) zone size.
+  // HM-SMR drives start with conventional zones, pure ZNS drives start with a
+  // sequential zone, but in both cases the zone size is the same everywhere.
+  nr = 1;
+  if (zbd_report_zones(zbd_fd, 0, 0, ZBD_RO_ALL, z.data(), &nr) != 0) {
     r = -errno;
-    derr << __func__ << " zbd_report_zones failed on " << path << dendl;
+    derr << __func__ << " zbd_report_zones failed on " << path << ": "
+	 << cpp_strerror(r) << dendl;
     goto fail;
   }
-
-  zone_size = zbd_zone_len(&zones[0]);
-  conventional_region_size = nr_zones * zone_size;
+  if (nr < 1) {
+    // the call succeeded, so errno is not set: do not return it
+    r = -EINVAL;
+    derr << __func__ << " " << path << " reports no zones" << dendl;
+    goto fail;
+  }
+  zone_size = zbd_zone_len(&z[0]);
+  conventional_region_size = nr_conv_zones * zone_size;
 
   // Determine the usable capacity of a sequential zone.  On HM-SMR drives the
   // capacity equals the zone size; ZNS SSDs may report a smaller capacity,

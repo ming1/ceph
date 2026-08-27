@@ -1328,7 +1328,16 @@ EOF
             fi
             mkdir -p $CEPH_DEV_DIR/osd$osd
             if [ -n "${block_devs[$osd]}" ]; then
-                dd if=/dev/zero of=${block_devs[$osd]} bs=1M count=1
+                if [ "$zoned_enabled" -eq 1 ]; then
+                    # Zoned (HM-SMR / ZNS) block devices reject buffered writes
+                    # to sequential-write-required zones: the page-cache
+                    # writeback of a plain dd is non-sequential and fails,
+                    # later surfacing as an fdatasync EIO during OSD mkfs.
+                    # mkfs resets all zones anyway, so skip zeroing here.
+                    :
+                else
+                    dd if=/dev/zero of=${block_devs[$osd]} bs=1M count=1
+                fi
                 ln -s ${block_devs[$osd]} $CEPH_DEV_DIR/osd$osd/block
             fi
             if [ -n "${bluestore_db_devs[$osd]}" ]; then
