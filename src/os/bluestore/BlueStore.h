@@ -893,6 +893,17 @@ public:
     }
   };
 
+#ifdef HAVE_LIBZBD
+  struct ZonedCleanerThread : public Thread {
+    BlueStore *store;
+    explicit ZonedCleanerThread(BlueStore *s) : store(s) {}
+    void *entry() override {
+      store->_zoned_cleaner_thread();
+      return nullptr;
+    }
+  };
+#endif
+
   // --------------------------------------------------------
   // members
 private:
@@ -1030,6 +1041,15 @@ private:
   std::deque<DeferredBatch*> deferred_stable_to_finalize; ///< pending finalization
   bool kv_finalize_in_progress = false;
 
+#ifdef HAVE_LIBZBD
+  ZonedCleanerThread zoned_cleaner_thread;
+  ceph::mutex zoned_cleaner_lock = ceph::make_mutex("BlueStore::zoned_cleaner_lock");
+  ceph::condition_variable zoned_cleaner_cond;
+  bool zoned_cleaner_started = false;
+  bool zoned_cleaner_stop = false;
+  std::deque<uint64_t> zoned_cleaner_queue;
+#endif
+
   PerfCounters *logger = nullptr;
 
   std::list<CollectionRef> removed_collections;
@@ -1055,6 +1075,10 @@ private:
   bool elastic_shared_blobs = false; ///< use smart ExtentMap::dup to reduce shared blob count
   bool use_write_v2 = false; ///< use new write path
   bool debug_extent_map_encode_check = false;
+
+  // smr-only
+  uint64_t zone_size = 0;              ///< number of SMR zones 
+  uint64_t first_sequential_zone = 0;  ///< first SMR zone that is sequential-only
 
   enum {
     // Please preserve the order since it's DB persistent
@@ -1512,6 +1536,16 @@ private:
   void _kv_stop();
   void _kv_sync_thread();
   void _kv_finalize_thread();
+
+#ifdef HAVE_LIBZBD
+  void _zoned_cleaner_start();
+  void _zoned_cleaner_stop();
+  void _zoned_cleaner_thread();
+  void _zoned_clean_zone(uint64_t zone_num,
+			 class ZonedAllocator *a,
+			 class ZonedFreelistManager *f);
+  void _clean_some(ghobject_t oid, uint32_t zone_num);
+#endif
 
   bluestore_deferred_op_t *_get_deferred_op(TransContext *txc, uint64_t len);
   void _deferred_queue(TransContext *txc);
