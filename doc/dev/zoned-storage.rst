@@ -19,6 +19,31 @@ drives are high capacity hard drives with the ZBC/ZAC interface.  The longer
 term goal is to support ZNS SSDs, as they become available, as well as overwrite
 workloads.
 
+Current status (restored support)
+---------------------------------
+
+Zoned BlueStore works on both host-managed SMR drives and ZNS SSDs (including
+ZNS namespaces whose per-zone capacity is smaller than the zone size, and
+"pure" ZNS devices with no conventional region, which keep BlueFS/RocksDB on a
+separate conventional ``block.db`` device).
+
+Inline compression is supported on zoned data devices.  Compressed blobs are
+immutable, allocation-unit aligned and garbage-collected, which already matches
+the append-only zoned model, so no on-disk format change is required.  Both
+BlueStore write paths work on zoned devices: the classic path and the newer
+``bluestore_write_v2`` path (which, on sequential zones, appends fresh blobs
+only, writes each allocation unit in full, and maintains the per-zone cleaner
+references the GC relies on).
+
+A write smaller than the allocation unit is not deferred on a zoned device: it
+is one asynchronous write of its own, and the kernel sends the writes of one
+zone to the device one at a time.  A transaction with about as many small writes
+as ``bdev_aio_max_queue_depth`` (1024 by default) is then submitted in many
+parts, and can run out of the retries of ``bdev_aio_submit_retry_max``, which
+aborts the OSD.  Raise ``bdev_aio_max_queue_depth`` for such a workload, 4096
+for example; each block device of each OSD takes that many from the
+``fs.aio-max-nr`` limit of the host.
+
 The first patch in these series enabled writing data to HM-SMR drives.  This
 patch introduces ZonedFreelistManger, a FreelistManager implementation that
 passes enough information to ZonedAllocator to correctly initialize state of
