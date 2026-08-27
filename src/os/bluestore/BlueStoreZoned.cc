@@ -38,6 +38,7 @@
 #undef dout_prefix
 #define dout_prefix *_dout << "bluestore(" << bstore->path << ") "
 
+using std::byte;
 using std::min;
 using std::map;
 using std::set;
@@ -508,16 +509,25 @@ void BlueStoreZoned::clean_zone(
     clean_some(oid, zone);
   }
 
+  // The relocations above are dispatched as asynchronous transactions whose
+  // freed extents are only returned to the allocator (incrementing the zone's
+  // dead-byte count) when each transaction finishes.  Drain them before
+  // checking live bytes -- and before we blow away the zone -- otherwise the
+  // not-yet-applied releases make a fully evacuated zone still look like it
+  // has live data.
+  //
+  // The drain is enough: on a zoned device _txc_finish() hands the released
+  // space back to the allocator before it takes the transaction off its
+  // sequencer, so once the sequencers are drained the live byte count
+  // includes every relocation.
+  bstore->_osr_drain_all();
+
   if (a->get_live_bytes(zone) > 0) {
     derr << "zone 0x" << std::hex << zone << " still has 0x" << a->get_live_bytes(zone)
 	 << " live bytes" << std::dec << dendl;
     // should we do something else here to avoid a live-lock in the event of a problem?
     return;
   }
-
-  // make sure transactions flush/drain/commit (and data is all rewritten
-  // safely elsewhere) before we blow away the cleaned zone
-  bstore->_osr_drain_all();
 
   // reset the device zone
   dout(10) << __func__ << " resetting zone 0x" << std::hex << zone << std::dec << dendl;
