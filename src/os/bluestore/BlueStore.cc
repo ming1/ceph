@@ -11560,6 +11560,10 @@ void BlueStore::_txc_finish_io(TransContext *txc)
    * even though aio will complete in any order.
    */
 
+  if (bdev->is_smr()) {
+    zoned.txc_finish_io(txc);
+  }
+
   OpSequencer *osr = txc->osr.get();
   std::lock_guard l(osr->qlock);
   txc->set_state(TransContext::STATE_IO_DONE);

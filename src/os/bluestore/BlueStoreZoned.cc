@@ -197,6 +197,7 @@ int BlueStoreZoned::init_alloc(std::map<uint64_t, uint64_t> *zone_adjustments)
 
   // init sequential zone based on the device's write pointers
   a->init_from_zone_pointers(std::move(zones));
+  a->init_zones_to_finish(wp);
   dout(1) << __func__
 	  << " loaded zone pointers: "
 	  << std::hex
@@ -784,6 +785,43 @@ void BlueStoreZoned::txc_finalize_kv(TransContext *txc)
     bufferlist v;
     txc->t->set(PREFIX_ZONED_CL_INFO, key, v);
   }
+  // All the allocations of this transaction are made, and the caller holds
+  // atomic_alloc_and_submit_lock, so the zones filled since the last
+  // transaction are the ones this transaction filled.
+  auto a = dynamic_cast<ZonedAllocator*>(bstore->alloc);
+  ceph_assert(a);
+  a->take_filled_zones(&txc->zones_to_finish);
+}
+
+void BlueStoreZoned::txc_finish_io(TransContext *txc)
+{
+  if (txc->zones_to_finish.empty()) {
+    return;
+  }
+  // The data of the transaction is on the device, the last bytes of these
+  // zones included.  Now the cleaner thread may finish them.
+  dout(10) << __func__ << " " << txc << " filled zones " << std::hex
+	   << txc->zones_to_finish << std::dec << dendl;
+  auto a = dynamic_cast<ZonedAllocator*>(bstore->alloc);
+  ceph_assert(a);
+  a->queue_zones_to_finish(txc->zones_to_finish);
+  txc->zones_to_finish.clear();
+  // The cleaner thread looks at the list and goes to sleep with this lock
+  // held.  Without it the notification could come in between and be lost,
+  // and the zones would wait for the next wakeup of the thread.
+  std::lock_guard l{zoned_cleaner_lock};
+  zoned_cleaner_cond.notify_all();
+}
+
+void BlueStoreZoned::finish_filled_zones(ZonedAllocator *a)
+{
+  std::vector<uint64_t> to_finish;
+  a->get_zones_to_finish(&to_finish);
+  for (uint64_t z : to_finish) {
+    dout(10) << __func__ << " finishing full zone 0x" << std::hex << z
+	     << std::dec << dendl;
+    bstore->bdev->finish_zone(z);
+  }
 }
 
 void BlueStoreZoned::cleaner_start()
@@ -823,9 +861,26 @@ void BlueStoreZoned::cleaner_thread()
   auto f = dynamic_cast<ZonedFreelistManager*>(bstore->fm);
   ceph_assert(f);
   while (true) {
+    // Transition zones the allocator has filled (but that did not reach the
+    // device's zone capacity, so the device did not auto-mark them FULL) to
+    // the FULL state, so they stop counting against the device's
+    // max_active_zones limit.  Done here, off the write path.  A zone gets
+    // on this list when the writes of the transaction that filled it are
+    // done, see txc_finish_io(): a finished zone rejects every write.
+    if (a->has_zones_to_finish()) {
+      l.unlock();
+      finish_filled_zones(a);
+      l.lock();
+      // more zones may have filled up meanwhile, and their notification
+      // came while this thread was not waiting
+      continue;
+    }
+
     // Exit promptly on shutdown, even when there is always a zone to clean
     // (otherwise the loop below would keep cleaning and never observe the stop
-    // request, hanging umount).
+    // request, hanging umount).  This is after the zone-finish step above:
+    // umount has drained all transactions by now, so that step has finished
+    // every zone that was filled, and none is left active on the device.
     if (zoned_cleaner_stop) {
       break;
     }
@@ -891,6 +946,9 @@ void BlueStoreZoned::clean_zone(
     dout(10) << __func__ << " zone 0x" << std::hex << zone << " offset 0x" << offset
 	     << std::dec << " " << oid << dendl;
     clean_some(oid, zone);
+    // Cleaning a zone can take long, and the writes of the clients and of
+    // the cleaner itself fill zones meanwhile.  Do not let them wait.
+    finish_filled_zones(a);
   }
 
   // The relocations above are asynchronous transactions.  Drain them before
