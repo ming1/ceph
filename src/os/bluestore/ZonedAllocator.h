@@ -13,6 +13,7 @@
 
 #include <mutex>
 #include <set>
+#include <vector>
 
 #include "AllocatorBase.h"
 #include "common/ceph_mutex.h"
@@ -42,6 +43,15 @@ class ZonedAllocator : public AllocatorBase {
   uint64_t num_zones;
   std::atomic<uint32_t> cleaning_zone = -1;
   std::vector<zone_state_t> zone_states;
+  // Zones the allocator has just filled and that need a device zone-finish.
+  // The write to the last allocated bytes may still be on its way, and a
+  // finished zone rejects it, so these are not ready yet.  The transaction
+  // that filled them takes them with take_filled_zones().
+  std::set<uint64_t> zones_filled;
+  // Zones that are filled and written and should be transitioned to the
+  // device FULL state (so they stop counting against max_active_zones).
+  // Drained by BlueStore, which issues the actual device zone-finish.
+  std::set<uint64_t> zones_to_finish;
   // Zones the cleaner failed to fully evacuate (residual live bytes it could
   // not relocate).  Excluded from future cleaning so the cleaner does not
   // live-lock re-selecting the same un-cleanable zone.  Cleared when the zone
@@ -69,10 +79,6 @@ private:
 
   inline void increment_num_dead_bytes(uint64_t zone_num, uint64_t length) {
     zone_states[zone_num].increment_num_dead_bytes(length);
-  }
-
-  inline bool fits(uint64_t want_size, uint64_t zone_num) const {
-    return want_size <= get_remaining_space(zone_num);
   }
 
 public:
@@ -112,6 +118,32 @@ public:
     size_t max_count,
     free_extent_vector_t* out) override;
 
+  // Move out the zones that were filled since the last call.  Allocations
+  // are serialized with the submission of their writes, so these are the
+  // zones the calling transaction filled.
+  void take_filled_zones(std::vector<uint64_t> *zones) {
+    std::scoped_lock l(lock);
+    zones->assign(zones_filled.begin(), zones_filled.end());
+    zones_filled.clear();
+  }
+  // The writes of the transaction that filled these zones are done.
+  void queue_zones_to_finish(const std::vector<uint64_t>& zones) {
+    std::scoped_lock l(lock);
+    zones_to_finish.insert(zones.begin(), zones.end());
+  }
+
+  bool has_zones_to_finish() {
+    std::scoped_lock l(lock);
+    return !zones_to_finish.empty();
+  }
+  // Move out the set of zones that have been filled and written, and need a
+  // device zone-finish to transition them to FULL.  Clears the internal set.
+  void get_zones_to_finish(std::vector<uint64_t> *zones) {
+    std::scoped_lock l(lock);
+    zones->assign(zones_to_finish.begin(), zones_to_finish.end());
+    zones_to_finish.clear();
+  }
+
   int64_t pick_zone_to_clean(float min_score, uint64_t min_saved);
   // Mark a zone the cleaner could not fully evacuate so it is not re-selected
   // (avoids a cleaner live-lock that would otherwise spin and flood the log).
@@ -133,6 +165,11 @@ public:
 
   void init_from_zone_pointers(
     std::vector<zone_state_t> &&_zone_states);
+  // Called once at mount, after init_from_zone_pointers().  The requests to
+  // finish a zone live only in memory, so queue again the zones that are
+  // filled and that the device does not report as full.  |device_wp| has the
+  // device's write pointer of each zone, as a device offset.
+  void init_zones_to_finish(const std::vector<uint64_t>& device_wp);
   void init_add_free(uint64_t offset, uint64_t length) override {}
   void init_rm_free(uint64_t offset, uint64_t length) override {}
 

@@ -45,6 +45,7 @@ public:
   bool is_smr() const final { return true; }
   void reset_all_zones() override;
   void reset_zone(uint64_t zone) override;
+  void finish_zone(uint64_t zone) override;
   std::vector<uint64_t> get_zones() override;
 
 };
