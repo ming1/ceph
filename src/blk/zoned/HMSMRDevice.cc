@@ -160,6 +160,16 @@ void HMSMRDevice::reset_zone(uint64_t zone)
   }
 }
 
+void HMSMRDevice::finish_zone(uint64_t zone)
+{
+  dout(10) << __func__ << " zone 0x" << std::hex << zone << std::dec << dendl;
+  if (zbd_finish_zones(zbd_fd, zone * zone_size, zone_size) != 0) {
+    derr << __func__ << " finishing zone failed for zone 0x" << std::hex
+	 << zone << std::dec << dendl;
+    ceph_abort("zbd_finish_zones failed");
+  }
+}
+
 std::vector<uint64_t> HMSMRDevice::get_zones()
 {
   std::vector<zbd_zone> zones;

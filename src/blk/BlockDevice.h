@@ -246,6 +246,12 @@ public:
   virtual void reset_zone(uint64_t zone) {
     ceph_assert(is_smr());
   }
+  // Transition a sequential zone to the FULL state so it no longer counts
+  // against the device's max_active_zones limit, even if it was not written
+  // all the way to its zone capacity.
+  virtual void finish_zone(uint64_t zone) {
+    ceph_assert(is_smr());
+  }
   virtual std::vector<uint64_t> get_zones() {
     ceph_assert(is_smr());
     return std::vector<uint64_t>();

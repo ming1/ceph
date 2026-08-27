@@ -208,6 +208,9 @@ namespace bluestore {
     // cleaning with less metadata than a ref for every extent.
     std::map<std::pair<OnodeRef, uint32_t>, uint64_t> new_zone_offset_refs;
     std::map<std::pair<OnodeRef, uint32_t>, uint64_t> old_zone_offset_refs;
+    /// zones whose last allocation unit this transaction allocated; they
+    /// can be finished on the device once its writes are done
+    std::vector<uint64_t> zones_to_finish;
     
     std::set<SharedBlobRef> shared_blobs;  ///< these need to be updated/written
 

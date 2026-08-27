@@ -86,6 +86,7 @@ class BlueStoreZoned {
   bool zoned_cleaner_stop = false;
 
   void cleaner_thread();
+  void finish_filled_zones(ZonedAllocator *a);
   void clean_zone(
     uint64_t zone,
     ZonedAllocator *a,
@@ -153,6 +154,7 @@ public:
     BlueStoreRepairer* repairer,
     int64_t& errors);
   void txc_finalize_kv(TransContext *txc);
+  void txc_finish_io(TransContext *txc);
   void cleaner_start();
   void cleaner_stop();
   void gc_whole_units(
@@ -285,6 +287,11 @@ inline void BlueStoreZoned::fsck_check_zones(
 }
 
 inline void BlueStoreZoned::txc_finalize_kv(TransContext *txc)
+{
+  BLUESTORE_ZONED_STUB;
+}
+
+inline void BlueStoreZoned::txc_finish_io(TransContext *txc)
 {
   BLUESTORE_ZONED_STUB;
 }
