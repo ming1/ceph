@@ -69,10 +69,6 @@ private:
     zone_states[zone_num].increment_num_dead_bytes(length);
   }
 
-  inline bool fits(uint64_t want_size, uint64_t zone_num) const {
-    return want_size <= get_remaining_space(zone_num);
-  }
-
 public:
   ZonedAllocator(CephContext* cct, int64_t size, int64_t block_size,
 		 int64_t _zone_size,

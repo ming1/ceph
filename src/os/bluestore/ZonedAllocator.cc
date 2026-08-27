@@ -63,12 +63,26 @@ int64_t ZonedAllocator::allocate(
 
   ceph_assert(want_size % 4096 == 0);
 
+  ceph_assert(alloc_unit > 0);
+
   ldout(cct, 10) << " trying to allocate 0x"
 		 << std::hex << want_size << std::dec << dendl;
 
+  // Fill zones completely, spilling the remainder of a request into subsequent
+  // zones (as additional extents) instead of requiring the whole request to
+  // fit one zone.  Otherwise, whenever the request size does not divide a
+  // zone's remaining space, the trailing "want_size - remaining" bytes are
+  // stranded: they stay counted as free but are never allocated, and the zone
+  // is left partially filled.  Filling the tail also lets starting_zone_num
+  // advance past full zones (avoiding an O(n^2) rescan of the stranded zones
+  // on every allocation).
+  const size_t extents_begin = extents->size();
+  const uint64_t starting_zone_saved = starting_zone_num;
+  int64_t allocated = 0;
+  uint64_t to_alloc = want_size;
   uint64_t left = num_zones - first_seq_zone_num;
   uint64_t zone_num = starting_zone_num;
-  for ( ; left > 0; ++zone_num, --left) {
+  for ( ; to_alloc > 0 && left > 0; ++zone_num, --left) {
     if (zone_num == num_zones) {
       zone_num = first_seq_zone_num;
     }
@@ -77,43 +91,52 @@ int64_t ZonedAllocator::allocate(
 		     << " because we are cleaning it" << std::dec << dendl;
       continue;
     }
-    if (!fits(want_size, zone_num)) {
-      ldout(cct, 10) << " skipping zone 0x" << std::hex << zone_num
-		     << " because there is not enough space: "
-		     << " want_size = 0x" << want_size
-		     << " available = 0x" << get_remaining_space(zone_num)
-		     << std::dec
-		     << dendl;
+    // Only alloc_unit-aligned space is allocatable.
+    uint64_t avail = p2align(get_remaining_space(zone_num), alloc_unit);
+    if (avail == 0) {
       continue;
     }
-    break;
+    uint64_t this_size = std::min(to_alloc, avail);
+    uint64_t offset = get_offset(zone_num);
+    increment_write_pointer(zone_num, this_size);
+    num_sequential_free -= this_size;
+    extents->emplace_back(bluestore_pextent_t(offset, this_size));
+    allocated += this_size;
+    to_alloc -= this_size;
+
+    ldout(cct, 10) << " allocated 0x" << std::hex << offset << "~" << this_size
+		   << " from zone 0x" << zone_num
+		   << " and zone offset 0x" << (offset % zone_size)
+		   << std::dec << dendl;
+
+    if (p2align(get_remaining_space(zone_num), alloc_unit) == 0) {
+      // No more allocatable space in this zone: never allocate from it again.
+      if (zone_num == starting_zone_num) {
+	starting_zone_num = zone_num + 1;
+      }
+    }
+    if (to_alloc == 0) {
+      break;
+    }
   }
 
-  if (left == 0) {
-    ldout(cct, 10) << " failed to allocate" << dendl;
+  if (to_alloc > 0) {
+    ldout(cct, 10) << " failed to allocate 0x" << std::hex << want_size
+		   << ", only got 0x" << allocated << std::dec << dendl;
+    // roll back this call's allocations so we do not leak space
+    for (size_t i = extents_begin; i < extents->size(); ++i) {
+      const auto& e = (*extents)[i];
+      uint64_t z = e.offset / zone_size;
+      zone_states[z].write_pointer -= e.length;
+      num_sequential_free += e.length;
+    }
+    extents->resize(extents_begin);
+    // the zones we passed have space again, so start from them next time
+    starting_zone_num = starting_zone_saved;
     return -ENOSPC;
   }
 
-  uint64_t offset = get_offset(zone_num);
-
-  ldout(cct, 10) << " moving zone 0x" << std::hex
-		 << zone_num << " write pointer from 0x" << offset
-		 << " -> 0x" << offset + want_size
-		 << std::dec << dendl;
-
-  increment_write_pointer(zone_num, want_size);
-  num_sequential_free -= want_size;
-  if (get_remaining_space(zone_num) == 0) {
-    starting_zone_num = zone_num + 1;
-  }
-
-  ldout(cct, 10) << " allocated 0x" << std::hex << offset << "~" << want_size
-		 << " from zone 0x" << zone_num
-		 << " and zone offset 0x" << (offset % zone_size)
-		 << std::dec << dendl;
-
-  extents->emplace_back(bluestore_pextent_t(offset, want_size));
-  return want_size;
+  return allocated;
 }
 
 void ZonedAllocator::release(const interval_set<uint64_t>& release_set)
