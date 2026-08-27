@@ -1682,7 +1682,7 @@ void zoned_release(ZonedAllocator& a, uint64_t zone, uint64_t offset,
 TEST(ZonedAllocator, marked_zone_with_live_bytes_is_skipped)
 {
   ZonedAllocator a(g_ceph_context, zoned_num_zones * zoned_zone_size, zoned_au,
-		   zoned_zone_size, 1, "zoned_test");
+		   zoned_zone_size, zoned_zone_size, 1, "zoned_test");
   std::vector<zone_state_t> states(zoned_num_zones);
   states[1] = zoned_full_zone(zoned_au);
   states[2] = zoned_full_zone(zoned_zone_size / 2);
@@ -1706,7 +1706,7 @@ TEST(ZonedAllocator, marked_zone_with_live_bytes_is_skipped)
 TEST(ZonedAllocator, marked_zone_without_live_bytes_is_picked)
 {
   ZonedAllocator a(g_ceph_context, zoned_num_zones * zoned_zone_size, zoned_au,
-		   zoned_zone_size, 1, "zoned_test");
+		   zoned_zone_size, zoned_zone_size, 1, "zoned_test");
   std::vector<zone_state_t> states(zoned_num_zones);
   states[1] = zoned_full_zone(zoned_au);
   a.init_from_zone_pointers(std::move(states));

@@ -195,6 +195,11 @@ protected:
   // of the drive.  The zones 524-52155 are sequential zones.
   uint64_t conventional_region_size = 0;
   uint64_t zone_size = 0;
+  // Usable capacity of a sequential zone.  On HM-SMR drives this equals
+  // |zone_size|, but ZNS SSDs may report a smaller capacity, leaving an
+  // unwritable gap of |zone_size - zone_capacity| bytes at the end of every
+  // sequential zone.  Zones are still laid out at |zone_size| stride.
+  uint64_t zone_capacity = 0;
   void add_stalled_read_event();
 
 public:
@@ -224,6 +229,12 @@ public:
   virtual uint64_t get_zone_size() const {
     ceph_assert(is_smr());
     return zone_size;
+  }
+  virtual uint64_t get_zone_capacity() const {
+    ceph_assert(is_smr());
+    // Fall back to the zone size for devices that do not report a distinct
+    // capacity (e.g. HM-SMR), so callers can use this unconditionally.
+    return zone_capacity ? zone_capacity : zone_size;
   }
   virtual uint64_t get_conventional_region_size() const {
     ceph_assert(is_smr());

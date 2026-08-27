@@ -51,7 +51,8 @@ int BlueStoreZoned::create_shared_alloc(uint64_t alloc_size)
   // The conventional region of a zoned device is randomly writable and
   // hosts BlueFS/metadata, so it must use a regular allocator -- never the
   // sequential-only "zoned" allocator (which would hand out the reserved
-  // bdev label/superblock region at offset 0).
+  // bdev label/superblock region at offset 0).  Conventional zones have
+  // capacity == size, hence we pass the conventional region size as both.
   std::string conventional_allocator_type = bstore->cct->_conf->bluestore_allocator;
   if (conventional_allocator_type == "zoned") {
     conventional_allocator_type = "hybrid";
@@ -60,7 +61,7 @@ int BlueStoreZoned::create_shared_alloc(uint64_t alloc_size)
     bstore->cct, conventional_allocator_type,
     bstore->bdev->get_conventional_region_size(),
     alloc_size,
-    zone_size, 0,
+    zone_size, zone_size, 0,
     "zoned_block");
   if (!a) {
     lderr(bstore->cct) << __func__ << " failed to create " << conventional_allocator_type
@@ -70,6 +71,11 @@ int BlueStoreZoned::create_shared_alloc(uint64_t alloc_size)
   }
   bstore->shared_alloc.set(a, alloc_size);
   return 0;
+}
+
+uint64_t BlueStoreZoned::allocatable_zone_capacity() const
+{
+  return p2align<uint64_t>(zone_capacity, bstore->min_alloc_size);
 }
 
 int BlueStoreZoned::init_alloc(std::map<uint64_t, uint64_t> *zone_adjustments)
@@ -92,7 +98,16 @@ int BlueStoreZoned::init_alloc(std::map<uint64_t, uint64_t> *zone_adjustments)
   for (unsigned i = first_sequential_zone; i < num_zones; ++i) {
     ceph_assert(wp[i] >= i * zone_size);
     ceph_assert(wp[i] <= (i + 1) * zone_size); // pos might be at start of next zone
-    uint64_t p = wp[i] - i * zone_size;
+    // Clamp to the allocatable capacity: on ZNS a full zone's device write
+    // pointer is reported at zone_start + zone_size (the zone length), but
+    // only the whole allocation units of the first zone_capacity bytes are
+    // usable and that is what the freelist tracks.  Without this clamp every
+    // full zone looks "ahead" of the freelist on each mount and generates a
+    // bogus adjustment.  The same holds for the tail smaller than an
+    // allocation unit of a zone that BlueStore has finished: it is neither
+    // written nor dead, and fsck does not count it.
+    uint64_t p = std::min<uint64_t>(wp[i] - i * zone_size,
+				    allocatable_zone_capacity());
     if (uint64_t tail = p % bstore->min_alloc_size; tail) {
       if (p % bstore->bdev->get_block_size()) {
 	// nothing can be written at such an offset, see is_valid_io()
@@ -231,6 +246,7 @@ void BlueStoreZoned::mkfs_prepare()
 {
   auto bdev = bstore->bdev;
   zone_size = bdev->get_zone_size();
+  zone_capacity = bdev->get_zone_capacity();
   first_sequential_zone = bdev->get_conventional_region_size() / zone_size;
   if (bstore->cct->_conf.get_val<bool>("bluestore_assume_clean_zones")) {
     // The operator states that every zone is already empty, so the reset
@@ -261,6 +277,11 @@ void BlueStoreZoned::mkfs_super(KeyValueDB::Transaction& t)
     bufferlist bl;
     encode((uint64_t)zone_size, bl);
     t->set(PREFIX_SUPER, "zone_size", bl);
+  }
+  {
+    bufferlist bl;
+    encode((uint64_t)zone_capacity, bl);
+    t->set(PREFIX_SUPER, "zone_capacity", bl);
   }
   {
     bufferlist bl;
@@ -529,7 +550,13 @@ void BlueStoreZoned::fsck_load(
   ceph_assert(wp.size() == zones.size());
   auto num_zones = bstore->bdev->get_size() / zone_size;
   for (unsigned i = first_sequential_zone; i < num_zones; ++i) {
-    uint64_t p = wp[i] == (i + 1) * zone_size ? zone_size : wp[i] % zone_size;
+    // Device write pointers are absolute; convert to a zone-relative offset.
+    // A full zone's device pointer is reported at zone_start + zone_size on
+    // ZNS, but only the whole allocation units of the first zone_capacity
+    // bytes are usable (zone_capacity == zone_size on HM-SMR), so clamp to
+    // that to match what the freelist tracks.
+    uint64_t p = std::min<uint64_t>(wp[i] - i * zone_size,
+				    allocatable_zone_capacity());
     // a write pointer inside an allocation unit that the freelist knows
     // nothing of counts as one at the end of the unit, as in init_alloc()
     if (uint64_t tail = p % bstore->min_alloc_size;

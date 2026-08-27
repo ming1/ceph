@@ -101,22 +101,27 @@ int ZonedFreelistManager::create(
   uint64_t new_size,
   uint64_t granularity,
   uint64_t new_zone_size,
+  uint64_t new_zone_capacity,
   uint64_t first_sequential_zone,
   KeyValueDB::Transaction txn)
 {
   size = new_size;
   bytes_per_block = granularity;
   zone_size = new_zone_size;
+  zone_capacity = new_zone_capacity;
   num_zones = size / zone_size;
   starting_zone_num = first_sequential_zone;
   enumerate_zone_num = ~0UL;
 
   ceph_assert(size % zone_size == 0);
+  ceph_assert(zone_capacity > 0);
+  ceph_assert(zone_capacity <= zone_size);
 
   dout(1) << __func__ << std::hex
 	  << " size 0x" << size
 	  << " bytes_per_block 0x" << bytes_per_block
 	  << " zone size 0x " << zone_size
+	  << " zone capacity 0x" << zone_capacity
 	  << " num_zones 0x" << num_zones
 	  << " starting_zone 0x" << starting_zone_num << dendl;
   {
@@ -133,6 +138,11 @@ int ZonedFreelistManager::create(
     bufferlist bl;
     encode(zone_size, bl);
     txn->set(meta_prefix, "zone_size", bl);
+  }
+  {
+    bufferlist bl;
+    encode(zone_capacity, bl);
+    txn->set(meta_prefix, "zone_capacity", bl);
   }
   {
     bufferlist bl;
@@ -162,11 +172,14 @@ int ZonedFreelistManager::init(
   }
 
   ceph_assert(num_zones == size / zone_size);
+  ceph_assert(zone_capacity > 0);
+  ceph_assert(zone_capacity <= zone_size);
 
   dout(10) << __func__ << std::hex
 	   << " size 0x" << size
 	   << " bytes_per_block 0x" << bytes_per_block
 	   << " zone size 0x" << zone_size
+	   << " zone capacity 0x" << zone_capacity
 	   << " num_zones 0x" << num_zones
 	   << " starting_zone 0x" << starting_zone_num
 	   << std::dec << dendl;
@@ -224,8 +237,13 @@ bool ZonedFreelistManager::enumerate_next(
   zone_state_t zone_state;
   load_zone_state_from_db(enumerate_zone_num, zone_state, enumerate_p);
 
+  // Conventional zones (below the first sequential zone) are randomly writable
+  // and have capacity == size; sequential zones expose only |zone_capacity|
+  // usable bytes, the rest being an unwritable gap.
+  uint64_t usable =
+    enumerate_zone_num < starting_zone_num ? zone_size : zone_capacity;
   *offset = enumerate_zone_num * zone_size + zone_state.get_write_pointer();
-  *length = zone_size - zone_state.get_write_pointer();
+  *length = usable - zone_state.get_write_pointer();
 
   dout(30) << __func__ << std::hex << " 0x" << *offset << "~" << *length
 	   << std::dec << dendl;
@@ -305,6 +323,7 @@ void ZonedFreelistManager::get_meta(
   res->emplace_back("zfm_size", stringify(size));
   res->emplace_back("zfm_bytes_per_block", stringify(bytes_per_block));
   res->emplace_back("zfm_zone_size", stringify(zone_size));
+  res->emplace_back("zfm_zone_capacity", stringify(zone_capacity));
   res->emplace_back("zfm_num_zones", stringify(num_zones));
   res->emplace_back("zfm_starting_zone_num", stringify(starting_zone_num));
 }
@@ -377,6 +396,27 @@ int ZonedFreelistManager::_read_cfg(cfg_reader_t cfg_reader)
       // this is expected for legacy deployed OSDs
       dout(0) << __func__ << " " << keys[i] << " not found in bdev meta" << dendl;
       return r;
+    }
+  }
+
+  // zfm_zone_capacity was introduced together with ZNS support.  OSDs created
+  // before that (HM-SMR) do not persist it; for those the capacity equals the
+  // zone size, so default to zone_size when the key is absent.
+  {
+    string val;
+    int r = cfg_reader("zfm_zone_capacity", &val);
+    if (r == 0) {
+      zone_capacity = strict_iecstrtoll(val.c_str(), &err);
+      if (!err.empty()) {
+        derr << __func__ << " Failed to parse - zfm_zone_capacity:" << val
+             << ", error: " << err << dendl;
+        return -EINVAL;
+      }
+    } else {
+      dout(0) << __func__ << " zfm_zone_capacity not found in bdev meta,"
+              << " defaulting to zone_size 0x" << std::hex << zone_size
+              << std::dec << dendl;
+      zone_capacity = zone_size;
     }
   }
   return 0;

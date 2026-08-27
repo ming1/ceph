@@ -105,6 +105,9 @@ public:
     : bstore(bstore), zoned_cleaner_thread(this) {}
 
   uint64_t zone_size = 0;              ///< size of a zone in bytes
+  uint64_t zone_capacity = 0;          ///< usable bytes per zone (<= zone_size on ZNS)
+  /// the part of a zone that can be allocated: whole allocation units
+  uint64_t allocatable_zone_capacity() const;
   uint64_t first_sequential_zone = 0;  ///< first SMR zone that is sequential-only
 
   /// Held from the allocation of a write to its submit, so that the writes
