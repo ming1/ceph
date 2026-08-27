@@ -22,8 +22,10 @@ workloads.
 Current status (restored support)
 ---------------------------------
 
-Zoned BlueStore works on host-managed SMR drives.  BlueFS/RocksDB are kept in
-the conventional zones at the start of the drive.
+Zoned BlueStore works on both host-managed SMR drives and ZNS SSDs (including
+ZNS namespaces whose per-zone capacity is smaller than the zone size, and
+"pure" ZNS devices with no conventional region, which keep BlueFS/RocksDB on a
+separate conventional ``block.db`` device).
 
 Inline compression is supported on zoned data devices.  Compressed blobs are
 immutable, allocation-unit aligned and garbage-collected, which already matches
