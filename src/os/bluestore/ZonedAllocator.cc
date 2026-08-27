@@ -128,6 +128,10 @@ void ZonedAllocator::release(const interval_set<uint64_t>& release_set)
     uint64_t num_dead = std::min(zone_size - offset % zone_size, length);
     for ( ; length; ++zone_num) {
       increment_num_dead_bytes(zone_num, num_dead);
+      // More of the zone is dead now, maybe all of what the cleaner could
+      // not move: let it try this zone again.  This cannot make the cleaner
+      // spin, because a new attempt needs a new release in the zone.
+      non_cleanable_zones.erase(zone_num);
       length -= num_dead;
       num_dead = std::min(zone_size, length);
     }
@@ -224,6 +228,10 @@ int64_t ZonedAllocator::pick_zone_to_clean(float min_score, uint64_t min_saved)
     if (zone_states[i].num_dead_bytes < min_saved) {
       continue;
     }
+    if (non_cleanable_zones.count(i)) {
+      // a previous cleaning attempt could not fully evacuate this zone
+      continue;
+    }
     if (best < 0 || score > best_score) {
       best = i;
       best_score = score;
@@ -252,8 +260,10 @@ int64_t ZonedAllocator::pick_zone_to_clean(float min_score, uint64_t min_saved)
 
 void ZonedAllocator::reset_zone(uint32_t zone)
 {
+  std::scoped_lock l(lock);
   num_sequential_free += zone_states[zone].write_pointer;
   zone_states[zone].reset();
+  non_cleanable_zones.erase(zone);
 }
 
 bool ZonedAllocator::low_on_space(void)
