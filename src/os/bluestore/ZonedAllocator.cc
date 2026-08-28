@@ -152,6 +152,18 @@ void ZonedAllocator::foreach(
   std::function<void(uint64_t offset, uint64_t length)> notify)
 {
   std::lock_guard l(lock);
+  // Free space in a sequential zone is the tail behind the write pointer, up to
+  // the end of the zone.  Reporting it keeps the generic consumers honest: the
+  // fragmentation score is computed from this walk, and scoring an empty set
+  // yields a garbage value and a permanent bogus "high free space
+  // fragmentation" health warning.
+  for (uint64_t zone = first_seq_zone_num; zone < num_zones; ++zone) {
+    uint64_t wp = get_write_pointer(zone);
+    if (wp >= zone_size) {
+      continue;
+    }
+    notify(zone * zone_size + wp, zone_size - wp);
+  }
 }
 
 uint64_t ZonedAllocator::get_free_extents(
