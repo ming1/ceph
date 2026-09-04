@@ -219,6 +219,30 @@ class Raw(BaseObjectStore):
                     self.pre_activate_tpm2(device)
         found = direct_report(self.devices)
 
+        # When activation is scoped to an explicit device list, that scan only
+        # sees the devices named on the command line. An OSD whose block.db or
+        # block.wal lives elsewhere would then be activated with no db/wal path,
+        # its OSD directory would get a "block" symlink and nothing else, and
+        # BlueFS would look for its superblock on the main device and abort in
+        # bluefs_super_t::decode. Complete the picture with a full scan, matched
+        # strictly by osd_uuid.
+        #
+        # Deliberately only the *paths* are taken from the full scan. Which OSDs
+        # get activated is still decided by the scoped scan above, because
+        # callers such as Rook invoke this with a device but without --osd-id or
+        # --osd-uuid, and widening the activation set would try to activate
+        # every foreign OSD present on the host.
+        if self.devices and any(not (m.get('device_db') and m.get('device_wal'))
+                                for m in found.values()):
+            everything = direct_report()
+            for osd_uuid, meta in found.items():
+                other = everything.get(osd_uuid, {})
+                for key in ('device_db', 'device_wal'):
+                    if not meta.get(key) and other.get(key):
+                        meta[key] = other[key]
+                        logger.info(f'resolved {key} {other[key]} for osd '
+                                    f'uuid {osd_uuid} by a full device scan')
+
         filter_osd_id = self.osd_id
         filter_osd_fsid = self.osd_fsid
 
