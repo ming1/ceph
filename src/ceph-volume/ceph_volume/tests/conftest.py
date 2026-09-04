@@ -529,7 +529,7 @@ def mock_lvm_direct_report(monkeypatch):
 
 @pytest.fixture
 def mock_raw_direct_report(monkeypatch):
-    monkeypatch.setattr('ceph_volume.objectstore.raw.direct_report', lambda x: raw_direct_report_data)
+    monkeypatch.setattr('ceph_volume.objectstore.raw.direct_report', lambda devices=None: raw_direct_report_data)
 
 @pytest.fixture
 def fake_lsblk_all(monkeypatch: Any) -> Callable:
