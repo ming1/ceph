@@ -15394,6 +15394,16 @@ void BlueStore::_kv_start()
 {
   dout(10) << __func__ << dendl;
 
+  // Discard ticks left on kv_wake by the previous mount's teardown
+  // (closing the data bdev drains its ring through the callbacks,
+  // which notify).  This has to happen here, before the thread
+  // exists: nothing has submitted data aio yet, so every tick posted
+  // from now on is a real completion or a real wakeup.  Draining
+  // inside the thread instead races its first transaction - on a
+  // fast mkfs the superblock write completes before the thread gets
+  // to run, its tick is swallowed, and the thread sleeps forever
+  // with the completion unreaped in the ring.
+  kv_wake.consume();
   finisher.start();
   kv_sync_thread.create("bstore_kv_sync");
   kv_finalize_thread.create("bstore_kv_final");
@@ -15452,8 +15462,6 @@ void BlueStore::_kv_sync_thread()
 {
   dout(10) << __func__ << " start" << dendl;
   deque<DeferredBatch*> deferred_stable_queue; ///< deferred ios done + stable
-  // a prior mount's teardown drain may have left stale ticks on the fd
-  kv_wake.consume();
   std::unique_lock l{kv_lock};
 
   auto t0 = mono_clock::now();
