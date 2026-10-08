@@ -15458,6 +15458,25 @@ static void append_and_clear(std::deque<T>& to, std::deque<T>& from)
   }
 }
 
+// Drain the data bdev's WRITE completion ring (a no-op unless the
+// device runs in external-completion mode).  The callbacks
+// (txc_aio_finish, deferred_aio_finish) run right here and stage
+// work under kv_lock as they always did, so the caller must not hold
+// it.  Reads are reaped by the device's own read-ring thread, never
+// here.
+//
+// Drains until a batch comes back short.  Completions arrive at
+// device rate and are consumed at callback rate, orders of magnitude
+// apart, so the backlog converges within a pass or two.  A count
+// bound instead lets the backlog grow without limit whenever the
+// device outpaces one batch per commit cycle; the ring then fills
+// and every submitter sits in the io_submit EAGAIN backoff.
+void BlueStore::_kv_reap_bdev_completions()
+{
+  while (bdev->reap_completions(BlockDevice::REAP_BATCH_MAX) ==
+	 BlockDevice::REAP_BATCH_MAX) {}
+}
+
 void BlueStore::_kv_sync_thread()
 {
   dout(10) << __func__ << " start" << dendl;
@@ -15493,22 +15512,7 @@ void BlueStore::_kv_sync_thread()
       l.unlock();
       kv_wake.wait_and_consume();
       twait += mono_clock::now() - t;
-      // Drain the data bdev's WRITE completion ring (a no-op unless
-      // the device runs in external-completion mode); the callbacks
-      // (txc_aio_finish, deferred_aio_finish) run right here and
-      // stage work under kv_lock as they always did.  Reads are
-      // reaped by the device's own read-ring thread, never here.
-      // One batched reap keeps a sustained completion stream from
-      // starving the commit work below; a full batch means the ring
-      // may hold more, and the fd was consumed above, so self-notify
-      // to come straight back after this cycle.
-      {
-	const int reap_max = std::clamp(int(cct->_conf->bdev_aio_reap_max),
-					1, BlockDevice::REAP_BATCH_MAX);
-	if (bdev->reap_completions(reap_max) == reap_max) {
-	  kv_wake.notify();
-	}
-      }
+      _kv_reap_bdev_completions();
       l.lock();
 
       dout(20) << __func__ << " wake" << dendl;
@@ -15534,6 +15538,13 @@ void BlueStore::_kv_sync_thread()
       kv_throttle_costs = 0;
       kv_throttle_txcs = 0;
       l.unlock();
+
+      // Empty the ring before this cycle's own waits (the bdev flush,
+      // the kv sync): nothing else drains it while this thread sits
+      // in them, and the idle branch above is not reached at all
+      // while kv_queue keeps refilling.  Whatever is reaped here is
+      // staged for the next cycle.
+      _kv_reap_bdev_completions();
 
       dout(30) << __func__ << " committing " << kv_committing << dendl;
       dout(30) << __func__ << " submitting " << kv_submitting << dendl;
@@ -15725,7 +15736,7 @@ void BlueStore::_kv_sync_thread()
   // nothing else drains the write ring after this thread exits; pick
   // up any straggler completions before teardown discards them (the
   // osr drains our callers run mean there normally are none)
-  while (bdev->reap_completions(BlockDevice::REAP_BATCH_MAX) > 0) {}
+  _kv_reap_bdev_completions();
   dout(10) << __func__ << " finish" << dendl;
 }
 

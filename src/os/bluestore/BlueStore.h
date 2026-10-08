@@ -3005,6 +3005,7 @@ private:
   void _kv_start();
   void _kv_stop();
   void _kv_sync_thread();
+  void _kv_reap_bdev_completions();
   void _kv_finalize_thread();
 
   bluestore_deferred_op_t *_get_deferred_op(TransContext *txc, uint64_t len);
