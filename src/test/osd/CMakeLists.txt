@@ -104,6 +104,12 @@ add_ceph_unittest(unittest_scrubber_be)
 target_link_libraries(unittest_scrubber_be osd os global ${CMAKE_DL_LIBS} mon ${BLKID_LIBRARIES})
 
 # unittest_pglog
+add_executable(unittest_osd_memory_target_defaults
+  test_osd_memory_target_defaults.cc
+  )
+add_ceph_unittest(unittest_osd_memory_target_defaults)
+target_link_libraries(unittest_osd_memory_target_defaults osd os global ${CMAKE_DL_LIBS} ${BLKID_LIBRARIES})
+
 add_executable(unittest_pglog
   TestPGLog.cc
   $<TARGET_OBJECTS:unit-main>
