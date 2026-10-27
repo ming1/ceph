@@ -14382,7 +14382,11 @@ void BlueStore::_wctx_finish(
 	    unshare_ptr);
 	  // we also drop zone ref for shared blob extents
 	  if (is_smr && e.is_valid()) {
-	    zones_with_releases.insert(e.offset / zoned.zone_size);
+	    for_each_zone_in_range(
+	      e.offset, e.length, zoned.zone_size,
+	      [&](uint32_t zone, uint64_t) {
+		zones_with_releases.insert(zone);
+	      });
 	  }
 	}
 	if (unshare) {
@@ -14406,7 +14410,11 @@ void BlueStore::_wctx_finish(
         txc->statfs_delta.compressed_allocated() -= e.length;
       }
       if (is_smr && e.is_valid()) {
-	zones_with_releases.insert(e.offset / zoned.zone_size);
+	for_each_zone_in_range(
+	  e.offset, e.length, zoned.zone_size,
+	  [&](uint32_t zone, uint64_t) {
+	    zones_with_releases.insert(zone);
+	  });
       }
     }
 
