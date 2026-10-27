@@ -313,13 +313,15 @@ void BlueStoreZoned::fsck_note_blob(
 {
   for (auto& e : blob.get_extents()) {
     if (e.is_valid()) {
-      uint32_t zone = e.offset / zone_size;
-      uint64_t offset = e.offset % zone_size;
-      auto p = zone_first_offsets.find(zone);
-      if (p == zone_first_offsets.end() || p->second > offset) {
-	// FIXME: use interator for guided insert?
-	zone_first_offsets[zone] = offset;
-      }
+      for_each_zone_in_range(
+	e.offset, e.length, zone_size,
+	[&](uint32_t zone, uint64_t offset) {
+	  auto p = zone_first_offsets.find(zone);
+	  if (p == zone_first_offsets.end() || p->second > offset) {
+	    // FIXME: use interator for guided insert?
+	    zone_first_offsets[zone] = offset;
+	  }
+	});
     }
   }
 }
@@ -894,9 +896,14 @@ void BlueStoreZoned::clean_some(ghobject_t oid, uint32_t zone)
     bool touches_zone = false;
     for (auto& be : e.blob->get_blob().get_extents()) {
       if (be.is_valid()) {
-	uint32_t z = be.offset / zone_size;
-	if (z == zone) {
-	  touches_zone = true;
+	for_each_zone_in_range(
+	  be.offset, be.length, zone_size,
+	  [&](uint32_t z, uint64_t) {
+	    if (z == zone) {
+	      touches_zone = true;
+	    }
+	  });
+	if (touches_zone) {
 	  break;
 	}
       }
@@ -1044,13 +1051,15 @@ void BlueStoreZoned::wctx_note_writes(
       if (!e.is_valid()) {
 	continue;
       }
-      uint32_t zone = e.offset / zone_size;
-      if (!o->onode.zone_offset_refs.count(zone)) {
-	uint64_t zoff = e.offset % zone_size;
-	dout(20) << __func__ << " add ref zone 0x" << std::hex << zone
-		 << " offset 0x" << zoff << std::dec << dendl;
-	txc->note_write_zone_offset(o, zone, zoff);
-      }
+      for_each_zone_in_range(
+	e.offset, e.length, zone_size,
+	[&](uint32_t zone, uint64_t zoff) {
+	  if (!o->onode.zone_offset_refs.count(zone)) {
+	    dout(20) << __func__ << " add ref zone 0x" << std::hex << zone
+		     << " offset 0x" << zoff << std::dec << dendl;
+	    txc->note_write_zone_offset(o, zone, zoff);
+	  }
+	});
     }
   }
 }
@@ -1066,7 +1075,11 @@ void BlueStoreZoned::wctx_drop_refs(
   for (auto& b : o->extent_map.extent_map) {
     for (auto& e : b.blob->get_blob().get_extents()) {
       if (e.is_valid()) {
-	zones_with_releases.erase(e.offset / zone_size);
+	for_each_zone_in_range(
+	  e.offset, e.length, zone_size,
+	  [&](uint32_t zone, uint64_t) {
+	    zones_with_releases.erase(zone);
+	  });
       }
     }
   }
@@ -1095,12 +1108,15 @@ void BlueStoreZoned::update_zone_refs(TransContext *txc, OnodeRef& o,
     if (!e.is_valid()) {
       continue;
     }
-    uint32_t zone = e.offset / zone_size;
-    if (!o->onode.zone_offset_refs.count(zone)) {
-      dout(20) << __func__ << " add ref zone 0x" << std::hex << zone
-	       << " offset 0x" << (e.offset % zone_size) << std::dec << dendl;
-      txc->note_write_zone_offset(o, zone, e.offset % zone_size);
-    }
+    for_each_zone_in_range(
+      e.offset, e.length, zone_size,
+      [&](uint32_t zone, uint64_t zone_offset) {
+	if (!o->onode.zone_offset_refs.count(zone)) {
+	  dout(20) << __func__ << " add ref zone 0x" << std::hex << zone
+		   << " offset 0x" << zone_offset << std::dec << dendl;
+	  txc->note_write_zone_offset(o, zone, zone_offset);
+	}
+      });
   }
 
   // A released extent may have been this onode's last reference to its zone.
@@ -1111,10 +1127,13 @@ void BlueStoreZoned::update_zone_refs(TransContext *txc, OnodeRef& o,
   std::set<uint32_t> candidates;
   for (const auto& e : released) {
     if (e.is_valid()) {
-      uint32_t zone = e.offset / zone_size;
-      if (o->onode.zone_offset_refs.count(zone)) {
-	candidates.insert(zone);
-      }
+      for_each_zone_in_range(
+	e.offset, e.length, zone_size,
+	[&](uint32_t zone, uint64_t) {
+	  if (o->onode.zone_offset_refs.count(zone)) {
+	    candidates.insert(zone);
+	  }
+	});
     }
   }
   if (candidates.empty()) {
@@ -1124,7 +1143,11 @@ void BlueStoreZoned::update_zone_refs(TransContext *txc, OnodeRef& o,
   for (auto& ex : o->extent_map.extent_map) {
     for (auto& pe : ex.blob->get_blob().get_extents()) {
       if (pe.is_valid()) {
-	candidates.erase(pe.offset / zone_size);
+	for_each_zone_in_range(
+	  pe.offset, pe.length, zone_size,
+	  [&](uint32_t zone, uint64_t) {
+	    candidates.erase(zone);
+	  });
       }
     }
     if (candidates.empty()) {
@@ -1158,14 +1181,16 @@ void BlueStoreZoned::clone_range_refs(
       if (!ex.is_valid()) {
 	continue;
       }
-      uint32_t zone = ex.offset / zone_size;
-      if (!newo->onode.zone_offset_refs.count(zone)) {
-	uint64_t zoff = ex.offset % zone_size;
-	dout(20) << __func__ << " add ref zone 0x" << std::hex << zone
-		 << " offset 0x" << zoff << std::dec
-		 << " -> " << newo->oid << dendl;
-	txc->note_write_zone_offset(newo, zone, zoff);
-      }
+      for_each_zone_in_range(
+	ex.offset, ex.length, zone_size,
+	[&](uint32_t zone, uint64_t zoff) {
+	  if (!newo->onode.zone_offset_refs.count(zone)) {
+	    dout(20) << __func__ << " add ref zone 0x" << std::hex << zone
+		     << " offset 0x" << zoff << std::dec
+		     << " -> " << newo->oid << dendl;
+	    txc->note_write_zone_offset(newo, zone, zoff);
+	  }
+	});
     }
   }
 }
