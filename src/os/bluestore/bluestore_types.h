@@ -264,6 +264,22 @@ std::ostream& operator<<(std::ostream& out, const bluestore_pextent_t& o);
 
 typedef mempool::bluestore_cache_other::vector<bluestore_pextent_t> PExtentVector;
 
+/// Call f(zone, zone_offset) for every zone that the physical range
+/// [offset, offset + length) touches; zone_offset is the offset of the
+/// range's first byte inside that zone (0 for every zone after the first).
+/// A range can span zones: the zoned allocator spills a request into the
+/// next zone, and release_extents() merges physically contiguous pieces.
+template <typename F>
+inline void for_each_zone_in_range(uint64_t offset, uint64_t length,
+                                   uint64_t zone_size, F&& f) {
+  if (!length || !zone_size) return;
+  const uint64_t first = offset / zone_size;
+  const uint64_t last = (offset + length - 1) / zone_size;
+  for (uint64_t zone = first; zone <= last; ++zone) {
+    f(static_cast<uint32_t>(zone), zone == first ? offset % zone_size : 0);
+  }
+}
+
 template<>
 struct denc_traits<PExtentVector> {
   static constexpr bool supported = true;

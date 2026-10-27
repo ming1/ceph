@@ -19,6 +19,8 @@
 #include "common/pretty_binary.h"
 #include <bitset>
 #include <sstream>
+#include <utility>
+#include <vector>
 #include <boost/random/mersenne_twister.hpp>
 #include <boost/random/uniform_int.hpp>
 
@@ -60,6 +62,58 @@ TEST(bluestore, sizeof) {
   cout << "map<uint64_t,uint64_t>\t" << sizeof(map<uint64_t, uint64_t>)
        << std::endl;
   cout << "map<char,char>\t" << sizeof(map<char, char>) << std::endl;
+}
+
+TEST(bluestore, for_each_zone_in_range) {
+  constexpr uint64_t zone_size = 16ull << 20;
+  using zone_offsets_t = std::vector<std::pair<uint32_t, uint64_t>>;
+  auto collect = [zone_size](uint64_t offset, uint64_t length) {
+    zone_offsets_t zones;
+    for_each_zone_in_range(
+      offset, length, zone_size,
+      [&](uint32_t zone, uint64_t zone_offset) {
+	zones.emplace_back(zone, zone_offset);
+      });
+    return zones;
+  };
+
+  EXPECT_EQ((zone_offsets_t{{0, 2ull << 20}}),
+	    collect(2ull << 20, 1ull << 20));
+  EXPECT_EQ((zone_offsets_t{{0, 15ull << 20}}),
+	    collect(15ull << 20, 1ull << 20));
+  EXPECT_EQ((zone_offsets_t{{0, (15ull << 20) + (1ull << 19)},
+			    {1, 0}}),
+	    collect((15ull << 20) + (1ull << 19),
+		    (3ull << 20) + (1ull << 19)));
+  EXPECT_EQ((zone_offsets_t{{0, 15ull << 20}, {1, 0}, {2, 0}}),
+	    collect(15ull << 20, 18ull << 20));
+  EXPECT_TRUE(collect(1ull << 20, 0).empty());
+}
+
+TEST(bluestore_blob_t, partial_release_spanning_zones) {
+  constexpr uint64_t zone_size = 16ull << 20;
+  constexpr uint64_t mebibyte = 1ull << 20;
+  bluestore_blob_t blob;
+  blob.allocated_test(bluestore_pextent_t(zone_size - mebibyte, mebibyte));
+  blob.allocated_test(bluestore_pextent_t(zone_size, 3 * mebibyte));
+
+  PExtentVector logical;
+  logical.emplace_back(512ull << 10, 4 * mebibyte - (512ull << 10));
+  PExtentVector released;
+  ASSERT_FALSE(blob.release_extents(false, logical, &released));
+  ASSERT_EQ(1u, released.size());
+  ASSERT_EQ(zone_size - (512ull << 10), released[0].offset);
+  ASSERT_EQ((7ull << 19), released[0].length);
+
+  std::vector<std::pair<uint32_t, uint64_t>> zones;
+  for_each_zone_in_range(
+    released[0].offset, released[0].length, zone_size,
+    [&](uint32_t zone, uint64_t zone_offset) {
+      zones.emplace_back(zone, zone_offset);
+    });
+  EXPECT_EQ((std::vector<std::pair<uint32_t, uint64_t>>{
+	      {0, (15ull << 20) + (1ull << 19)}, {1, 0}}),
+	    zones);
 }
 
 // Note: Reusable for future bit-flip fuzzing.
