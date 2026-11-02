@@ -42,7 +42,7 @@ function TEST_osd_pool_get_set() {
     create_pool $TEST_POOL 8
 
     local flag
-    for flag in nodelete nopgchange nosizechange write_fadvise_dontneed noscrub nodeep-scrub; do
+    for flag in nodelete nopgchange nosizechange write_fadvise_dontneed read_fadvise_dontneed noscrub nodeep-scrub; do
 	ceph osd pool set $TEST_POOL $flag 0 || return 1
 	! ceph osd dump | grep 'pool ' | grep $flag || return 1
 	ceph osd pool set $TEST_POOL $flag 1 || return 1

@@ -1240,7 +1240,7 @@ Subcommand ``get`` gets pool parameter <var>.
 Usage::
 
     ceph osd pool get <poolname> size|min_size|pg_num|pgp_num|crush_rule|hashpspool|
-    nodelete|nopgchange|nosizechange|write_fadvise_dontneed
+    nodelete|nopgchange|nosizechange|write_fadvise_dontneed|read_fadvise_dontneed
 
 Only for tiered pools::
 
@@ -1303,7 +1303,7 @@ Usage::
     target_max_bytes|target_max_objects|cache_target_dirty_ratio|
     cache_target_dirty_high_ratio|
     cache_target_full_ratio|cache_min_flush_age|cache_min_evict_age|
-    min_read_recency_for_promote|write_fadvise_dontneed|hit_set_grade_decay_rate|
+    min_read_recency_for_promote|write_fadvise_dontneed|read_fadvise_dontneed|hit_set_grade_decay_rate|
     hit_set_search_last_n
     <val> {--yes-i-really-mean-it}
 

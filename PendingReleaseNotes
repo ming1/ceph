@@ -1,5 +1,12 @@
 >=22.0.0
 
+* RADOS: New pool flag ``read_fadvise_dontneed`` (``ceph osd pool set <pool>
+  read_fadvise_dontneed true``). With it set, the OSDs do not keep the pool's
+  object data in their cache after serving a client read, as if every read
+  carried ``LIBRADOS_OP_FLAG_FADVISE_DONTNEED``. For pools whose objects are
+  rarely read twice, such as an RGW data pool, this keeps the OSD's memory for
+  metadata and for pools that benefit from caching.
+
 * OSD: When ``osd_memory_target`` is below its 4 GiB default, OSDs now scale
   down limits on memory that the cache autotuner cannot shrink, by
   ``osd_memory_target`` / 4 GiB, as long as each is still at its default:

@@ -513,6 +513,23 @@ You may set values for the following keys:
    :Type: Integer
    :Valid Range: ``1`` sets flag, ``0`` unsets flag
 
+.. _read_fadvise_dontneed:
+
+.. describe:: read_fadvise_dontneed
+
+   :Description: Sets or unsets the ``READ_FADVISE_DONTNEED`` flag on a given
+                 pool. With the flag set, the OSDs serve the pool's object
+                 data reads (read, sparse read, checksum, cmpext and the read
+                 side of a copy) as if they carried
+                 ``LIBRADOS_OP_FLAG_FADVISE_DONTNEED``: the data is served but
+                 not kept in the OSD's cache, which leaves the cache to
+                 metadata and to pools whose data is read again. Meant for
+                 pools whose objects are rarely read twice, such as an RGW data
+                 pool of a file-sharing or backup service. A client read that
+                 hints ``FADVISE_WILLNEED`` is still cached.
+   :Type: Integer
+   :Valid Range: ``1`` sets flag, ``0`` unsets flag
+
 .. _noscrub:
 
 .. describe:: noscrub

@@ -1266,7 +1266,8 @@ COMMAND("osd pool get "
           "|target_size_bytes"
           "|target_size_ratio"
           "|use_gmt_hitset"
-          "|write_fadvise_dontneed",
+          "|write_fadvise_dontneed"
+          "|read_fadvise_dontneed",
 	"get pool parameter <var>", "osd", "r")
 COMMAND("osd pool set "
 	"name=pool,type=CephPoolname "
@@ -1332,7 +1333,8 @@ COMMAND("osd pool set "
           "|target_size_ratio"
           "|unset_pool_flags"
           "|use_gmt_hitset"
-          "|write_fadvise_dontneed "
+          "|write_fadvise_dontneed"
+          "|read_fadvise_dontneed "
 	"name=val,type=CephString "
 	"name=yes_i_really_mean_it,type=CephBool,req=false",
 	"set pool parameter <var> to <val>", "osd", "rw")

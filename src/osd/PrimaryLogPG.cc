@@ -6212,6 +6212,20 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
       }
     }
 
+    if (pool.info.has_flag(pg_pool_t::FLAG_READ_FADVISE_DONTNEED)) {
+      // the pool's data is read once: keep it out of the object store's
+      // cache (a client that hints WILLNEED still gets it cached)
+      switch (op.op) {
+      case CEPH_OSD_OP_READ:
+      case CEPH_OSD_OP_SYNC_READ:
+      case CEPH_OSD_OP_SPARSE_READ:
+      case CEPH_OSD_OP_CHECKSUM:
+      case CEPH_OSD_OP_CMPEXT:
+      case CEPH_OSD_OP_COPY_GET:
+	op.flags = op.flags | CEPH_OSD_OP_FLAG_FADVISE_DONTNEED;
+      }
+    }
+
     // TODO: check endianness (ceph_le32 vs uint32_t, etc.)
     // The fields in ceph_osd_op are little-endian (according to the definition in rados.h),
     // but the code in this function seems to treat them as native-endian.  What should the
