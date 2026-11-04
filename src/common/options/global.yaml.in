@@ -7343,6 +7343,11 @@ options:
   min: 0
   max: 1
   with_legacy: true
+- name: bluestore_assume_clean_zones
+  type: bool
+  level: advanced
+  desc: Bypass physical zone resets during mkfs if the hardware zones are already manually cleared
+  default: false
 - name: bluestore_onode_segment_size
   type: size
   level: advanced

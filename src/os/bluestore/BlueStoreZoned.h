@@ -107,7 +107,8 @@ public:
   int create_shared_alloc(uint64_t alloc_size);
   int init_alloc(std::map<uint64_t, uint64_t> *zone_adjustments);
   void post_init_alloc(const std::map<uint64_t, uint64_t>& zone_adjustments);
-  /// mkfs: read the zone layout of the device and reset the zones
+  /// mkfs: read the zone layout of the device and reset the zones (unless
+  /// bluestore_assume_clean_zones is set)
   void mkfs_prepare();
   /// mkfs: give BlueFS the conventional region
   void mkfs_init_main_device(uint64_t reserved);
