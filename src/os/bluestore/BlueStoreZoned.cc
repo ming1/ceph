@@ -159,7 +159,16 @@ void BlueStoreZoned::mkfs_prepare()
   auto bdev = bstore->bdev;
   zone_size = bdev->get_zone_size();
   first_sequential_zone = bdev->get_conventional_region_size() / zone_size;
-  bdev->reset_all_zones();
+  if (bstore->cct->_conf.get_val<bool>("bluestore_assume_clean_zones")) {
+    // The operator states that every zone is already empty, so the reset
+    // (slow on large drives) is skipped.
+    dout(1) << __func__ << " bluestore_assume_clean_zones is set,"
+	    << " not resetting the zones" << dendl;
+  } else {
+    dout(1) << __func__ << " resetting all zones" << dendl;
+    bdev->reset_all_zones();
+    dout(1) << __func__ << " done resetting all zones" << dendl;
+  }
 }
 
 void BlueStoreZoned::mkfs_init_main_device(uint64_t reserved)
