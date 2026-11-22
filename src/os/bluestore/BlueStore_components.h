@@ -201,7 +201,6 @@ namespace bluestore {
     std::set<OnodeRef> onodes;     ///< these need to be updated/written
     std::set<OnodeRef> modified_objects;  ///< objects we modified (and need a ref)
 
-#ifdef HAVE_LIBZBD
     // zone refs to add/remove.  each zone ref is a (zone, offset) tuple.  The offset
     // is the first offset in the zone that the onode touched; subsequent writes
     // to that zone do not generate additional refs.  This is a bit imprecise but
@@ -209,7 +208,6 @@ namespace bluestore {
     // cleaning with less metadata than a ref for every extent.
     std::map<std::pair<OnodeRef, uint32_t>, uint64_t> new_zone_offset_refs;
     std::map<std::pair<OnodeRef, uint32_t>, uint64_t> old_zone_offset_refs;
-#endif
 
     std::set<SharedBlobRef> shared_blobs;  ///< these need to be updated/written
 
@@ -298,7 +296,6 @@ namespace bluestore {
       onodes.erase(o);
     }
 
-#ifdef HAVE_LIBZBD
     void note_write_zone_offset(OnodeRef& o, uint32_t zone, uint64_t offset) {
       o->onode.zone_offset_refs[zone] = offset;
       new_zone_offset_refs[std::make_pair(o, zone)] = offset;
@@ -307,7 +304,6 @@ namespace bluestore {
       old_zone_offset_refs[std::make_pair(o, zone)] = offset;
       o->onode.zone_offset_refs.erase(zone);
     }
-#endif
 
     void aio_finish(BlueStore* store) override {
       store->txc_aio_finish(this);

@@ -27,6 +27,7 @@ add_library(bluestore OBJECT
 
 if(WITH_ZBD)
   target_sources(bluestore PRIVATE
+    BlueStoreZoned.cc
     ZonedAllocator.cc
     ZonedFreelistManager.cc)
 endif()

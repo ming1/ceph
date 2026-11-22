@@ -63,6 +63,7 @@ set(alien_store_srcs
   ${PROJECT_SOURCE_DIR}/src/os/memstore/MemStore.cc)
 if(WITH_ZBD)
   list(APPEND alien_store_srcs
+    ${PROJECT_SOURCE_DIR}/src/os/bluestore/BlueStoreZoned.cc
     ${PROJECT_SOURCE_DIR}/src/os/bluestore/ZonedFreelistManager.cc
     ${PROJECT_SOURCE_DIR}/src/os/bluestore/ZonedAllocator.cc)
 endif()
