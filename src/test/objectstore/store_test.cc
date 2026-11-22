@@ -4456,7 +4456,12 @@ TEST_P(StoreTestSpecificAUSize, BlueStoreReconstructAllocationsTest)
       ch.reset();
       // this trims hoid one out of onode cache
       EXPECT_EQ(store->umount(), 0);
-      EXPECT_EQ(store->fsck(true), 4);
+      // The lost shared blob record gives 4 errors.  A zoned store reports
+      // two more for the same damage, because it has two more persistent
+      // records that count the blob's space: statfs (kept in the DB, where a
+      // regular store with a null freelist manager rebuilds it from the
+      // onodes at mount) and the dead bytes of the zone.
+      EXPECT_EQ(store->fsck(true), smr ? 6 : 4);
       store->repair(true);
       EXPECT_EQ(store->fsck(true), 0);
       EXPECT_EQ(store->mount(), 0);
