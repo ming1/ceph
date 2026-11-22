@@ -114,6 +114,11 @@ public:
 
   void mark_zone_to_clean_free(uint64_t zone,
 			       KeyValueDB *kvdb);
+
+  /// fsck repair: change a zone's dead bytes from the value in the DB
+  void adjust_num_dead_bytes(uint64_t zone,
+			     uint64_t from, uint64_t to,
+			     KeyValueDB::Transaction txn);
 };
 
 #endif
