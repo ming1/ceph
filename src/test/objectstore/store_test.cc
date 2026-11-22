@@ -248,6 +248,12 @@ class MultiLabelTest : public CheckedUmount {
     return data_dir;
   }
   bool bdev_supports_label() {
+    if (smr) {
+      // A zoned device keeps a single label: the extra copies would land
+      // in sequential zones, which cannot be rewritten in place.  It can
+      // not be expanded either.
+      return false;
+    }
     BlueStore* bstore = dynamic_cast<BlueStore*> (store.get());
     if (!bstore) return false;
     auto bdev = bstore->get_bdev();
