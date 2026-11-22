@@ -326,6 +326,14 @@ public:
   coll_t cid;
   ObjectStore::CollectionHandle ch;
 
+  // A "threadsafe" death test starts the test binary again and runs the
+  // test from the top in the child, mkfs included.  The child gets its own
+  // directory, but with --bluestore-block-path it formats the very device
+  // the parent's store is on, and the parent cannot mount its store again.
+  bool death_test_reformats_store() {
+    return !g_conf()->bluestore_block_path.empty();
+  }
+
   void prepare_store()
   {
     static constexpr uint64_t _1G = uint64_t(1024)*1024*1024;
@@ -12553,6 +12561,9 @@ TEST_P(CorruptedOnodesTest, Fsck_TolerateCorruptedOnodes)
 // via ceph_assert (coredump/backtrace preserved).
 TEST_P(CorruptedOnodesTest, CorruptedOnode_RegularPathStillCrashes)
 {
+  if (death_test_reformats_store()) {
+    GTEST_SKIP() << "death test would mkfs the shared block device, skipping";
+  }
   GTEST_FLAG_SET(death_test_style, "threadsafe");
   SetVal(g_conf(), "bluestore_debug_inject_allocation_from_file_failure", "0");
   SetVal(g_conf(), "bluestore_debug_onode_segmentation_random", "false");
@@ -12641,6 +12652,9 @@ TEST_P(CorruptedOnodesTest, Fsck_ToleratesCorruptionDuringAllocationRecovery)
 
 TEST_P(CorruptedOnodesTest, ColdOpen_StillAssertsOnCorruptOnode)
 {
+  if (death_test_reformats_store()) {
+    GTEST_SKIP() << "death test would mkfs the shared block device, skipping";
+  }
   g_ceph_context->_conf._clear_safe_to_start_threads();
   GTEST_FLAG_SET(death_test_style, "threadsafe");   // mount() leaves threads running
   SetVal(g_conf(), "bluestore_debug_enforce_settings", "ssd");
