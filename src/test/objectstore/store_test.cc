@@ -248,6 +248,12 @@ class MultiLabelTest : public CheckedUmount {
     return data_dir;
   }
   bool bdev_supports_label() {
+    if (smr) {
+      // A zoned device keeps a single label: the extra copies would land
+      // in sequential zones, which cannot be rewritten in place.  It can
+      // not be expanded either.
+      return false;
+    }
     BlueStore* bstore = dynamic_cast<BlueStore*> (store.get());
     if (!bstore) return false;
     auto bdev = bstore->get_bdev();
@@ -7984,6 +7990,9 @@ public:
 TEST_P(DeferredWriteTest, NewData) {
   const bool print = false;
   deferred_test_t t = GetParam();
+  if (smr && t.prefer_deferred_size > 0) {
+    GTEST_SKIP() << "smr, skipping: no deferred writes on zoned devices";
+  }
   SetVal(g_conf(), "bdev_block_size", stringify(t.bdev_block_size).c_str());
   SetVal(g_conf(), "bluestore_min_alloc_size", stringify(t.min_alloc_size).c_str());
   SetVal(g_conf(), "bluestore_max_blob_size", stringify(t.max_blob_size).c_str());
@@ -8072,6 +8081,9 @@ class DeferredReplayTest : public DeferredWriteTest {
 TEST_P(DeferredReplayTest, DeferredReplay) {
   const bool print = false;
   deferred_test_t t = GetParam();
+  if (smr) {
+    GTEST_SKIP() << "smr, skipping: no deferred writes on zoned devices";
+  }
   SetVal(g_conf(), "bluestore_write_v2", "false");
   SetVal(g_conf(), "bdev_block_size", stringify(t.bdev_block_size).c_str());
   SetVal(g_conf(), "bluestore_min_alloc_size", stringify(t.min_alloc_size).c_str());
@@ -8158,6 +8170,9 @@ TEST_P(DeferredReplayTest, DeferredReplay) {
 TEST_P(DeferredReplayTest, DeferredReplayInReadOnly) {
   const bool print = false;
   deferred_test_t t = GetParam();
+  if (smr) {
+    GTEST_SKIP() << "smr, skipping: no deferred writes on zoned devices";
+  }
   SetVal(g_conf(), "bluestore_write_v2", "false");
   SetVal(g_conf(), "bdev_block_size", stringify(t.bdev_block_size).c_str());
   SetVal(g_conf(), "bluestore_min_alloc_size", stringify(t.min_alloc_size).c_str());
@@ -12621,6 +12636,12 @@ TEST_P(CorruptedOnodesTest, Fsck_ToleratesCorruptionDuringAllocationRecovery)
 
 TEST_P(CorruptedOnodesTest, ColdOpen_StillAssertsOnCorruptOnode)
 {
+  if (smr) {
+    // The zoned freelist manager keeps the allocation state in the DB, so
+    // cold_open() never rebuilds it from the onodes and never decodes the
+    // corrupt one.
+    GTEST_SKIP() << "smr, skipping: no allocation recovery from onodes";
+  }
   g_ceph_context->_conf._clear_safe_to_start_threads();
   GTEST_FLAG_SET(death_test_style, "threadsafe");   // mount() leaves threads running
   SetVal(g_conf(), "bluestore_debug_enforce_settings", "ssd");
@@ -14760,6 +14781,9 @@ void doOverwriteDeferredTest(ObjectStore* store, bool v2) {
 TEST_P(StoreTestSpecificAUSize, OverwriteDeferredTest) {
   if (string(GetParam()) != "bluestore")
     return;
+  if (smr) {
+    GTEST_SKIP() << "smr, skipping: no deferred writes on zoned devices";
+  }
 
   // enforce 'hddd' settings to enable deferred writes
   SetVal(g_conf(), "bluestore_debug_enforce_settings", "hybrid");
@@ -14776,6 +14800,9 @@ TEST_P(StoreTestSpecificAUSize, OverwriteDeferredTest) {
 TEST_P(StoreTestSpecificAUSize, OverwriteDeferredV2Test) {
   if (string(GetParam()) != "bluestore")
     return;
+  if (smr) {
+    GTEST_SKIP() << "smr, skipping: no deferred writes on zoned devices";
+  }
 
   // enforce 'hddd' settings to enable deferred writes
   SetVal(g_conf(), "bluestore_debug_enforce_settings", "hybrid");
