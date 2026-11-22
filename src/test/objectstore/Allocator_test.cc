@@ -1647,3 +1647,77 @@ TEST(Btree2Allocator, try_remove_leftover_split_makes_progress)
   }), extents(a));
 }
 
+
+#ifdef HAVE_LIBZBD
+#include "os/bluestore/ZonedAllocator.h"
+
+namespace {
+// 4 zones of 1M, the first one conventional.  The capacity is 15.5
+// allocation units, so each sequential zone has a tail of half a unit that
+// cannot be allocated, and needs an explicit zone-finish once it is filled.
+constexpr uint64_t zoned_au = 0x10000;
+constexpr uint64_t zoned_zone_size = 1 << 20;
+constexpr uint64_t zoned_zone_capacity = zoned_zone_size - zoned_au / 2;
+constexpr uint64_t zoned_num_zones = 4;
+
+std::vector<uint64_t> zones_to_finish(ZonedAllocator& a) {
+  std::vector<uint64_t> zones;
+  a.get_zones_to_finish(&zones);
+  return zones;
+}
+}
+
+TEST(ZonedAllocator, finish_filled_zones_at_mount)
+{
+  ZonedAllocator a(g_ceph_context, zoned_num_zones * zoned_zone_size, zoned_au,
+		   zoned_zone_size, zoned_zone_capacity, 1, "zoned_test");
+  std::vector<zone_state_t> states(zoned_num_zones);
+  std::vector<uint64_t> device_wp(zoned_num_zones);
+  // zone 1: filled, and the device still has it open
+  states[1].write_pointer = 15 * zoned_au;
+  device_wp[1] = zoned_zone_size + 15 * zoned_au;
+  // zone 2: filled, and the device has it full already
+  states[2].write_pointer = 15 * zoned_au;
+  device_wp[2] = 3 * zoned_zone_size;
+  // zone 3: one unit is left to allocate
+  states[3].write_pointer = 14 * zoned_au;
+  device_wp[3] = 3 * zoned_zone_size + 14 * zoned_au;
+
+  a.init_from_zone_pointers(std::move(states));
+  a.init_zones_to_finish(device_wp);
+  EXPECT_EQ(std::vector<uint64_t>{1}, zones_to_finish(a));
+}
+
+// A zone that an allocation fills must not be finished before the write to
+// the allocated space is done: the device rejects a write to a full zone.
+TEST(ZonedAllocator, finish_filled_zone_after_its_write)
+{
+  ZonedAllocator a(g_ceph_context, zoned_num_zones * zoned_zone_size, zoned_au,
+		   zoned_zone_size, zoned_zone_capacity, 1, "zoned_test");
+  a.init_from_zone_pointers(std::vector<zone_state_t>(zoned_num_zones));
+
+  // fill zone 1 and take one unit of zone 2
+  PExtentVector extents;
+  EXPECT_EQ(int64_t(16 * zoned_au),
+	    a.allocate(16 * zoned_au, zoned_au, 0, 0, &extents));
+  ASSERT_EQ(2u, extents.size());
+  EXPECT_EQ(zoned_zone_size, extents[0].offset);
+  EXPECT_EQ(15 * zoned_au, extents[0].length);
+
+  // the write is on its way: nothing to finish yet
+  EXPECT_TRUE(zones_to_finish(a).empty());
+
+  // the transaction learns what it filled, once
+  std::vector<uint64_t> filled;
+  a.take_filled_zones(&filled);
+  EXPECT_EQ(std::vector<uint64_t>{1}, filled);
+  a.take_filled_zones(&filled);
+  EXPECT_TRUE(filled.empty());
+  EXPECT_TRUE(zones_to_finish(a).empty());
+
+  // the write is done
+  a.queue_zones_to_finish({1});
+  EXPECT_EQ(std::vector<uint64_t>{1}, zones_to_finish(a));
+  EXPECT_TRUE(zones_to_finish(a).empty());
+}
+#endif
