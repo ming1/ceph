@@ -117,9 +117,14 @@ public:
     const bluestore_blob_t& blob,
     std::map<uint32_t, uint64_t>& zone_first_offsets);
   void fsck_check_refs(
-    const ghobject_t& oid,
+    OnodeRef& o,
     const std::map<uint32_t, uint64_t>& zone_first_offsets,
     std::vector<std::unordered_map<ghobject_t, uint64_t>> *zone_refs,
+    BlueStoreRepairer *repairer,
+    int64_t& errors);
+  void fsck_check_stray_refs(
+    const std::vector<std::unordered_map<ghobject_t, uint64_t>>& zone_refs,
+    BlueStoreRepairer* repairer,
     int64_t& errors);
   void fsck_load(
     bool shallow,
@@ -130,6 +135,7 @@ public:
   void fsck_check_zones(
     mempool_dynamic_bitset& used_blocks,
     uint64_t alloc_size,
+    BlueStoreRepairer* repairer,
     int64_t& errors);
   void txc_finalize_kv(TransContext *txc);
   void cleaner_start();
@@ -219,9 +225,18 @@ inline void BlueStoreZoned::fsck_note_blob(
 }
 
 inline void BlueStoreZoned::fsck_check_refs(
-  const ghobject_t& oid,
+  OnodeRef& o,
   const std::map<uint32_t, uint64_t>& zone_first_offsets,
   std::vector<std::unordered_map<ghobject_t, uint64_t>> *zone_refs,
+  BlueStoreRepairer *repairer,
+  int64_t& errors)
+{
+  BLUESTORE_ZONED_STUB;
+}
+
+inline void BlueStoreZoned::fsck_check_stray_refs(
+  const std::vector<std::unordered_map<ghobject_t, uint64_t>>& zone_refs,
+  BlueStoreRepairer* repairer,
   int64_t& errors)
 {
   BLUESTORE_ZONED_STUB;
@@ -240,6 +255,7 @@ inline void BlueStoreZoned::fsck_load(
 inline void BlueStoreZoned::fsck_check_zones(
   mempool_dynamic_bitset& used_blocks,
   uint64_t alloc_size,
+  BlueStoreRepairer* repairer,
   int64_t& errors)
 {
   BLUESTORE_ZONED_STUB;

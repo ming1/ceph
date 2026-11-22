@@ -382,6 +382,20 @@ int ZonedFreelistManager::_read_cfg(cfg_reader_t cfg_reader)
   return 0;
 }
 
+void ZonedFreelistManager::adjust_num_dead_bytes(
+  uint64_t zone,
+  uint64_t from, uint64_t to,
+  KeyValueDB::Transaction txn)
+{
+  dout(10) << __func__ << " zone 0x" << std::hex << zone
+	   << " dead bytes 0x" << from << " -> 0x" << to << std::dec << dendl;
+  // The merge operator adds 64-bit words and wraps around, so a difference
+  // below zero lowers the count.
+  zone_state_t delta;
+  delta.increment_num_dead_bytes(to - from);
+  write_zone_state_delta_to_db(zone, delta, txn);
+}
+
 void ZonedFreelistManager::mark_zone_to_clean_free(
   uint64_t zone,
   KeyValueDB *kvdb)

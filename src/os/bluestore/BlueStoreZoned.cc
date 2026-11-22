@@ -214,12 +214,25 @@ void BlueStoreZoned::fsck_note_blob(
 }
 
 void BlueStoreZoned::fsck_check_refs(
-  const ghobject_t& oid,
+  OnodeRef& o,
   const std::map<uint32_t, uint64_t>& zone_first_offsets,
   std::vector<std::unordered_map<ghobject_t, uint64_t>> *zone_refs,
+  BlueStoreRepairer *repairer,
   int64_t& errors)
 {
+  const ghobject_t& oid = o->oid;
+  auto& onode_refs = o->onode.zone_offset_refs;
+  // repair: zone ref keys to add and to remove, and whether the onode's
+  // own copy of its zone refs has changed
+  std::vector<std::string> keys_to_add, keys_to_rm;
+  bool onode_changed = false;
+  size_t fixed = 0;
+
   for (auto& [zone, first_offset] : zone_first_offsets) {
+    if (zone >= zone_refs->size()) {
+      // an extent past the end of the device: not an error of the zone refs
+      continue;
+    }
     auto p = (*zone_refs)[zone].find(oid);
     if (p != (*zone_refs)[zone].end()) {
       if (first_offset < p->second) {
@@ -237,8 +250,92 @@ void BlueStoreZoned::fsck_check_refs(
     } else {
       derr << "fsck error: " << oid << " references zone 0x" << std::hex << zone
 	   << " but there is no zone ref" << std::dec << dendl;
-      // FIXME: add repair
       ++errors;
+      if (repairer) {
+	// Without the key the cleaner cannot find this object's data in the
+	// zone.  Key it by the offset the onode has, if any: that is the
+	// key a later release of the ref removes.
+	auto q = onode_refs.find(zone);
+	if (q == onode_refs.end()) {
+	  q = onode_refs.emplace(zone, first_offset).first;
+	  onode_changed = true;
+	}
+	get_zone_offset_object_key(zone, q->second, oid,
+				   &keys_to_add.emplace_back());
+	++fixed;
+      }
+    }
+  }
+
+  // The onode lists a zone it has no data in.  Just removing the key (as a
+  // stray zone ref) is not enough: as long as the onode lists the zone, a
+  // later write of this object into the zone adds no key.
+  for (auto p = onode_refs.begin(); p != onode_refs.end(); ) {
+    auto zone = p->first;
+    if (zone_first_offsets.count(zone)) {
+      ++p;
+      continue;
+    }
+    derr << "fsck error: " << oid << " has a zone ref for zone 0x" << std::hex
+	 << zone << " offset 0x" << p->second << std::dec
+	 << " but references nothing there" << dendl;
+    ++errors;
+    if (zone < zone_refs->size()) {
+      // this is the same damage; do not report the key again as stray
+      auto& refs = (*zone_refs)[zone];
+      auto q = refs.find(oid);
+      if (q != refs.end()) {
+	if (repairer) {
+	  get_zone_offset_object_key(zone, q->second, oid,
+				     &keys_to_rm.emplace_back());
+	}
+	refs.erase(q);
+      }
+    }
+    if (repairer) {
+      p = onode_refs.erase(p);
+      onode_changed = true;
+      ++fixed;
+    } else {
+      ++p;
+    }
+  }
+
+  if (fixed) {
+    repairer->fix_onode(
+      bstore->db,
+      [&](KeyValueDB::Transaction txn) {
+	bufferlist v;
+	for (auto& k : keys_to_add) {
+	  txn->set(PREFIX_ZONED_CL_INFO, k, v);
+	}
+	for (auto& k : keys_to_rm) {
+	  txn->rmkey(PREFIX_ZONED_CL_INFO, k);
+	}
+	if (onode_changed) {
+	  bstore->_record_onode(o, txn);
+	}
+      },
+      fixed);
+  }
+}
+
+void BlueStoreZoned::fsck_check_stray_refs(
+  const std::vector<std::unordered_map<ghobject_t, uint64_t>>& zone_refs,
+  BlueStoreRepairer* repairer,
+  int64_t& errors)
+{
+  // what is left has no object that references the zone
+  for (uint32_t zone = 0; zone < zone_refs.size(); ++zone) {
+    for (auto& [oid, offset] : zone_refs[zone]) {
+      derr << "fsck error: stray zone ref 0x" << std::hex << zone
+	   << " offset 0x" << offset << " -> " << std::dec << oid << dendl;
+      ++errors;
+      if (repairer) {
+	string key;
+	get_zone_offset_object_key(zone, offset, oid, &key);
+	repairer->remove_key(bstore->db, PREFIX_ZONED_CL_INFO, key);
+      }
     }
   }
 }
@@ -285,7 +382,7 @@ void BlueStoreZoned::fsck_load(
 	ghobject_t oid;
 	string key = it->key();
 	int r = get_key_zone_offset_object(key, &zone, &offset, &oid);
-	if (r < 0) {
+	if (r < 0 || zone >= zone_refs.size()) {
 	  derr << "fsck error: invalid zone ref key " << pretty_binary_string(key)
 	       << dendl;
 	  if (repair) {
@@ -314,6 +411,7 @@ void BlueStoreZoned::fsck_load(
 void BlueStoreZoned::fsck_check_zones(
   mempool_dynamic_bitset& used_blocks,
   uint64_t alloc_size,
+  BlueStoreRepairer* repairer,
   int64_t& errors)
 {
   // verify per-zone state
@@ -321,6 +419,8 @@ void BlueStoreZoned::fsck_check_zones(
   //  - verify num_dead_bytes count (neither allocated nor
   //    free space past the write pointer)
   auto a = dynamic_cast<ZonedAllocator*>(bstore->alloc);
+  auto f = dynamic_cast<ZonedFreelistManager*>(bstore->fm);
+  ceph_assert(f);
   auto num_zones = bstore->bdev->get_size() / zone_size;
 
   // mark the free space past the write pointer
@@ -380,7 +480,18 @@ void BlueStoreZoned::fsck_check_zones(
 	   << " dead bytes but freelist says 0x" << a->get_dead_bytes(zone)
 	   << dendl;
       ++errors;
-      // TODO: repair
+      if (repairer) {
+	// The count from the onodes is the truth.  The allocator's count is
+	// the one in the DB: a repair opens the DB read-write and has
+	// already written out any write pointer adjustment.
+	auto in_db = a->get_dead_bytes(zone);
+	// the zone states are the freelist of a zoned device
+	repairer->fix_freelist(
+	  bstore->db,
+	  [&](KeyValueDB::Transaction txn) {
+	    f->adjust_num_dead_bytes(zone, in_db, zone_dead, txn);
+	  });
+      }
     }
   }
   used_blocks.flip();

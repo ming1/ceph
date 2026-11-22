@@ -6748,7 +6748,8 @@ BlueStore::OnodeRef BlueStore::fsck_check_objects_shallow(
     }
 
     if (bdev->is_smr() && depth != FSCK_SHALLOW) {
-      zoned.fsck_check_refs(oid, zone_first_offsets, ctx.zone_refs, errors);
+      zoned.fsck_check_refs(o, zone_first_offsets,
+			     ctx.zone_refs, ctx.repairer, errors);
     }
 
     if (broken) {
@@ -7801,14 +7802,8 @@ int BlueStore::_fsck_on_open(BlueStore::FSCKDepth depth, bool repair, bluestore_
 
   if (bdev->is_smr() && depth != FSCK_SHALLOW) {
     dout(1) << __func__ << " checking for leaked zone refs" << dendl;
-    for (uint32_t zone = 0; zone < zone_refs.size(); ++zone) {
-      for (auto& [oid, offset] : zone_refs[zone]) {
-	derr << "fsck error: stray zone ref 0x" << std::hex << zone
-	     << " offset 0x" << offset << " -> " << std::dec << oid << dendl;
-	// FIXME: add repair
-	++errors;
-      }
-    }
+    zoned.fsck_check_stray_refs(zone_refs, repair ? &repairer : nullptr,
+				 errors);
   }
 
   sb_ref_mismatches = sb_ref_counts.count_non_zero();
@@ -8288,7 +8283,8 @@ int BlueStore::_fsck_on_open(BlueStore::FSCKDepth depth, bool repair, bluestore_
     // skip freelist vs allocated compare when we have Null fm
     if (!fm->is_null_manager() && freelist_type == "zoned") {
       dout(1) << __func__ << " checking freelist vs allocated" << dendl;
-      zoned.fsck_check_zones(used_blocks, alloc_size, errors);
+      zoned.fsck_check_zones(used_blocks, alloc_size,
+			     repair ? &repairer : nullptr, errors);
     } else if (!fm->is_null_manager()) {
       dout(1) << __func__ << " checking freelist vs allocated" << dendl;
       if (!bdev->supported_bdev_label()) {
@@ -16796,6 +16792,31 @@ bool BlueStoreRepairer::fix_spanning_blobs(
   f(fix_onode_txn);
   ++to_repair_cnt;
   return true;
+}
+
+void BlueStoreRepairer::fix_onode(
+  KeyValueDB* db,
+  std::function<void(KeyValueDB::Transaction)> f,
+  size_t repairs)
+{
+  std::lock_guard l(lock);
+  if (!fix_onode_txn) {
+    fix_onode_txn = db->get_transaction();
+  }
+  f(fix_onode_txn);
+  to_repair_cnt += repairs;
+}
+
+void BlueStoreRepairer::fix_freelist(
+  KeyValueDB* db,
+  std::function<void(KeyValueDB::Transaction)> f)
+{
+  std::lock_guard l(lock);
+  if (!fix_fm_leaked_txn) {
+    fix_fm_leaked_txn = db->get_transaction();
+  }
+  f(fix_fm_leaked_txn);
+  ++to_repair_cnt;
 }
 
 bool BlueStoreRepairer::preprocess_misreference(KeyValueDB *db)

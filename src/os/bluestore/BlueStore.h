@@ -2800,6 +2800,17 @@ public:
   bool fix_spanning_blobs(
     KeyValueDB* db,
     std::function<void(KeyValueDB::Transaction)> f);
+  /// Queue a change of an onode, and of keys that go with it, for the
+  /// transaction that repairs onodes.  It counts as |repairs| repairs.
+  void fix_onode(
+    KeyValueDB* db,
+    std::function<void(KeyValueDB::Transaction)> f,
+    size_t repairs = 1);
+  /// Queue a change of the freelist for the transaction that repairs it.
+  /// It counts as one repair.
+  void fix_freelist(
+    KeyValueDB* db,
+    std::function<void(KeyValueDB::Transaction)> f);
 
   bool preprocess_misreference(KeyValueDB *db);
 
