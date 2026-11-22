@@ -893,7 +893,6 @@ public:
     }
   };
 
-#ifdef HAVE_LIBZBD
   struct ZonedCleanerThread : public Thread {
     BlueStore *store;
     explicit ZonedCleanerThread(BlueStore *s) : store(s) {}
@@ -902,7 +901,6 @@ public:
       return nullptr;
     }
   };
-#endif
 
   // --------------------------------------------------------
   // members
@@ -1041,14 +1039,12 @@ private:
   std::deque<DeferredBatch*> deferred_stable_to_finalize; ///< pending finalization
   bool kv_finalize_in_progress = false;
 
-#ifdef HAVE_LIBZBD
   ZonedCleanerThread zoned_cleaner_thread;
   ceph::mutex zoned_cleaner_lock = ceph::make_mutex("BlueStore::zoned_cleaner_lock");
   ceph::condition_variable zoned_cleaner_cond;
   bool zoned_cleaner_started = false;
   bool zoned_cleaner_stop = false;
   std::deque<uint64_t> zoned_cleaner_queue;
-#endif
 
   PerfCounters *logger = nullptr;
 
@@ -1537,7 +1533,6 @@ private:
   void _kv_sync_thread();
   void _kv_finalize_thread();
 
-#ifdef HAVE_LIBZBD
   void _zoned_cleaner_start();
   void _zoned_cleaner_stop();
   void _zoned_cleaner_thread();
@@ -1545,7 +1540,6 @@ private:
 			 class ZonedAllocator *a,
 			 class ZonedFreelistManager *f);
   void _clean_some(ghobject_t oid, uint32_t zone_num);
-#endif
 
   bluestore_deferred_op_t *_get_deferred_op(TransContext *txc, uint64_t len);
   void _deferred_queue(TransContext *txc);
@@ -2665,6 +2659,54 @@ private:
   void _fsck_check_objects(FSCKDepth depth,
     FSCK_ObjectCtx& ctx);
 
+  // zoned devices: bodies of the larger zoned code paths, see BlueStoreZoned.cc
+  int _zoned_create_shared_alloc(uint64_t alloc_size);
+  int _zoned_init_alloc(std::map<uint64_t, uint64_t> *zone_adjustments);
+  void _zoned_post_init_alloc(const std::map<uint64_t, uint64_t>& zone_adjustments);
+  void _zoned_mkfs_super(KeyValueDB::Transaction& t);
+  void _zoned_fsck_note_blob(
+    const bluestore_blob_t& blob,
+    std::map<uint32_t, uint64_t>& zone_first_offsets);
+  void _zoned_fsck_check_refs(
+    const ghobject_t& oid,
+    const std::map<uint32_t, uint64_t>& zone_first_offsets,
+    const FSCK_ObjectCtx& ctx,
+    int64_t& errors);
+  void _zoned_fsck_load(
+    FSCKDepth depth,
+    bool repair,
+    BlueStoreRepairer& repairer,
+    std::vector<std::unordered_map<ghobject_t, uint64_t>>& zone_refs,
+    int64_t& errors);
+  void _zoned_fsck_check_zones(
+    mempool_dynamic_bitset& used_blocks,
+    uint64_t alloc_size,
+    int64_t& errors);
+  void _zoned_txc_finalize_kv(TransContext *txc);
+  void _zoned_do_write_small(
+    CollectionRef& c,
+    OnodeRef& o,
+    uint64_t offset, uint64_t length,
+    uint64_t alloc_len,
+    ceph::buffer::list& bl,
+    WriteContext *wctx);
+  void _zoned_wctx_note_writes(
+    TransContext *txc,
+    OnodeRef& o,
+    WriteContext *wctx);
+  void _zoned_wctx_drop_refs(
+    TransContext *txc,
+    OnodeRef& o,
+    std::set<uint32_t>& zones_with_releases);
+  void _zoned_clone_range_refs(
+    TransContext *txc,
+    OnodeRef& newo,
+    uint64_t dstoff, uint64_t length);
+  void _zoned_rename_refs(
+    TransContext *txc,
+    OnodeRef& oldo,
+    OnodeRef& newo);
+
 public:
   static int create_bdev_labels(CephContext *cct,
                           const std::string& path,
@@ -2900,5 +2942,8 @@ private:
   fsck_interval misreferenced_extents;
 
 };
+
+// zoned devices: shared helpers, and inline stubs when built without libzbd
+#include "BlueStoreZoned.h"
 
 #endif

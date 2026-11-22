@@ -69,10 +69,9 @@
 #include "BlueAdmin.h"
 #include "extblkdev/ExtBlkDevPlugin.h"
 
-#ifdef HAVE_LIBZBD
 #include "ZonedAllocator.h"
 #include "ZonedFreelistManager.h"
-#endif
+#include "BlueStoreZoned.h"
 
 #if defined(WITH_LTTNG)
 #define TRACEPOINT_DEFINE
@@ -150,11 +149,9 @@ const std::string PREFIX_ALLOC = "B";       // u64 offset -> u64 length (freelis
 const std::string PREFIX_ALLOC_BITMAP = "b";// (see BitmapFreelistManager)
 const std::string PREFIX_SHARED_BLOB = "X"; // u64 SB id -> shared_blob_t
 
-#ifdef HAVE_LIBZBD
 const std::string PREFIX_ZONED_FM_META = "Z";  // (see ZonedFreelistManager)
 const std::string PREFIX_ZONED_FM_INFO = "z";  // (see ZonedFreelistManager)
 const std::string PREFIX_ZONED_CL_INFO = "G";  // (per-zone cleaner metadata)
-#endif
 
 const std::string BLUESTORE_GLOBAL_STATFS_KEY = "bluestore_statfs";
 
@@ -587,7 +584,7 @@ static int get_key_pool_stat(const string& key, uint64_t* pool_id)
 }
 
 #ifdef HAVE_LIBZBD
-static void get_zone_offset_object_key(
+void get_zone_offset_object_key(
   uint32_t zone,
   uint64_t offset,
   ghobject_t oid,
@@ -599,7 +596,7 @@ static void get_zone_offset_object_key(
   _get_object_key(oid, key);
 }
 
-static int get_key_zone_offset_object(
+int get_key_zone_offset_object(
   const std::string& key,
   uint32_t *zone,
   uint64_t *offset,
@@ -1994,9 +1991,7 @@ BlueStore::BlueStore(CephContext *cct,
     finisher(cct, "commit_finisher", "cfin"),
     kv_sync_thread(this),
     kv_finalize_thread(this),
-#ifdef HAVE_LIBZBD
     zoned_cleaner_thread(this),
-#endif
     min_alloc_size(_min_alloc_size),
     min_alloc_size_order(std::countr_zero(_min_alloc_size)),
     mempool_thread(this)
@@ -3464,12 +3459,10 @@ void BlueStore::_set_alloc_sizes(void)
 {
   max_alloc_size = cct->_conf->bluestore_max_alloc_size;
 
-#ifdef HAVE_LIBZBD
   ceph_assert(bdev);
   if (bdev->is_smr()) {
     prefer_deferred_size = 0;
   } else
-#endif
   if (cct->_conf->bluestore_prefer_deferred_size) {
     prefer_deferred_size = cct->_conf->bluestore_prefer_deferred_size;
   } else {
@@ -3743,11 +3736,9 @@ int BlueStore::_create_alloc()
 
   std::string allocator_type = cct->_conf->bluestore_allocator;
 
-#ifdef HAVE_LIBZBD
   if (freelist_type == "zoned") {
     allocator_type = "zoned";
   }
-#endif
 
   alloc = Allocator::create(
     cct, allocator_type,
@@ -3762,23 +3753,12 @@ int BlueStore::_create_alloc()
     return -EINVAL;
   }
 
-#ifdef HAVE_LIBZBD
   if (freelist_type == "zoned") {
-    Allocator *a = Allocator::create(
-      cct, cct->_conf->bluestore_allocator,
-      bdev->get_conventional_region_size(),
-      alloc_size,
-      zone_size, 0,
-      "zoned_block");
-    if (!a) {
-      lderr(cct) << __func__ << " failed to create " << cct->_conf->bluestore_allocator
-		 << " allocator" << dendl;
-      delete alloc;
-      return -EINVAL;
+    int r = _zoned_create_shared_alloc(alloc_size);
+    if (r < 0) {
+      return r;
     }
-    shared_alloc.set(a, alloc_size);
   } else
-#endif
   {
     // BlueFS will share the same allocator
     shared_alloc.set(alloc, alloc_size);
@@ -3795,65 +3775,9 @@ int BlueStore::_init_alloc(std::map<uint64_t, uint64_t> *zone_adjustments)
   }
   ceph_assert(alloc != NULL);
 
-#ifdef HAVE_LIBZBD
   if (bdev->is_smr()) {
-    auto a = dynamic_cast<ZonedAllocator*>(alloc);
-    ceph_assert(a);
-    auto f = dynamic_cast<ZonedFreelistManager*>(fm);
-    ceph_assert(f);
-    vector<uint64_t> wp = bdev->get_zones();
-    vector<zone_state_t> zones = f->get_zone_states(db);
-    ceph_assert(wp.size() == zones.size());
-
-    // reconcile zone state
-    auto num_zones = bdev->get_size() / zone_size;
-    for (unsigned i = first_sequential_zone; i < num_zones; ++i) {
-      ceph_assert(wp[i] >= i * zone_size);
-      ceph_assert(wp[i] <= (i + 1) * zone_size); // pos might be at start of next zone
-      uint64_t p = wp[i] - i * zone_size;
-      if (zones[i].write_pointer > p) {
-	derr << __func__ << " zone 0x" << std::hex << i
-	     << " bluestore write pointer 0x" << zones[i].write_pointer
-	     << " > device write pointer 0x" << p
-	     << std::dec << " -- VERY SUSPICIOUS!" << dendl;
-      } else if (zones[i].write_pointer < p) {
-	// this is "normal" in that it can happen after any crash (if we have a
-	// write in flight but did not manage to commit the transaction)
-	auto delta = p - zones[i].write_pointer;
-	dout(1) << __func__ << " zone 0x" << std::hex << i
-		 << " device write pointer 0x" << p
-		 << " > bluestore pointer 0x" << zones[i].write_pointer
-		 << ", advancing 0x" << delta << std::dec << dendl;
-	(*zone_adjustments)[zones[i].write_pointer] = delta;
-	zones[i].num_dead_bytes += delta;
-	zones[i].write_pointer = p;
-      }
-    }
-
-    // start with conventional zone "free" (bluefs may adjust this when it starts up)
-    auto reserved = _get_ondisk_reserved();
-    // for now we require a conventional zone
-    ceph_assert(bdev->get_conventional_region_size());
-    ceph_assert(shared_alloc.a != alloc);  // zoned allocator doesn't use conventional region
-    shared_alloc.a->init_add_free(
-      reserved,
-      p2align(bdev->get_conventional_region_size(), min_alloc_size) - reserved);
-
-    // init sequential zone based on the device's write pointers
-    a->init_from_zone_pointers(std::move(zones));
-    dout(1) << __func__
-	    << " loaded zone pointers: "
-	    << std::hex
-	    << ", allocator type " << alloc->get_type()
-	    << ", capacity 0x" << alloc->get_capacity()
-	    << ", block size 0x" << alloc->get_block_size()
-	    << ", free 0x" << alloc->get_free()
-	    << ", fragmentation " << alloc->get_fragmentation()
-	    << std::dec << dendl;
-
-    return 0;
+    return _zoned_init_alloc(zone_adjustments);
   }
-#endif
 
   uint64_t num = 0, bytes = 0;
   utime_t start_time = ceph_clock_now();
@@ -3925,24 +3849,9 @@ int BlueStore::_init_alloc(std::map<uint64_t, uint64_t> *zone_adjustments)
 void BlueStore::_post_init_alloc(const std::map<uint64_t, uint64_t>& zone_adjustments)
 {
   int r = 0;
-#ifdef HAVE_LIBZBD
   if (bdev->is_smr()) {
-    if (zone_adjustments.empty()) {
-      return;
-    }
-    dout(1) << __func__ << " adjusting freelist based on device write pointers" << dendl;
-    auto f = dynamic_cast<ZonedFreelistManager*>(fm);
-    ceph_assert(f);
-    KeyValueDB::Transaction t = db->get_transaction();
-    for (auto& i : zone_adjustments) {
-      // allocate AND release since this gap is now dead space
-      // note that the offset is imprecise, but only need to select the zone
-      f->allocate(i.first, i.second, t);
-      f->release(i.first, i.second, t);
-    }
-    r = db->submit_transaction_sync(t);
+    _zoned_post_init_alloc(zone_adjustments);
   } else
-#endif
   if (fm->is_null_manager()) {
     // Now that we load the allocation map we need to invalidate the file as new allocation won't be reflected
     // Changes to the allocation map (alloc/release) are not updated inline and will only be stored on umount()
@@ -4497,9 +4406,7 @@ int BlueStore::_open_db_and_around(
 
   // when function is called in repair mode (to_repair=true) we skip db->open()/create()
   if (!is_db_rotational() && !read_only && !to_repair && cct->_conf->bluestore_allocation_from_file
-#ifdef HAVE_LIBZBD
       && !bdev->is_smr()
-#endif
     ) {
     dout(5) << __func__ << "::NCB::Commit to Null-Manager" << dendl;
     commit_to_null_manager();
@@ -5223,14 +5130,12 @@ int BlueStore::mkfs()
   }
 
   // choose freelist manager
-#ifdef HAVE_LIBZBD
   if (bdev->is_smr()) {
     freelist_type = "zoned";
     zone_size = bdev->get_zone_size();
     first_sequential_zone = bdev->get_conventional_region_size() / zone_size;
     bdev->reset_all_zones();
   } else
-#endif
   {
     freelist_type = "bitmap";
   }
@@ -5285,13 +5190,11 @@ int BlueStore::mkfs()
       alloc->init_rm_free(location, size);
     }
   }
-#ifdef HAVE_LIBZBD
   if (bdev->is_smr() && alloc != shared_alloc.a) {
     shared_alloc.a->init_add_free(reserved,
 				  p2align(bdev->get_conventional_region_size(),
 					  min_alloc_size) - reserved);
   }
-#endif
 
   r = _open_db(true);
   if (r < 0)
@@ -5324,20 +5227,9 @@ int BlueStore::mkfs()
       t->set(PREFIX_SUPER, "per_pool_omap", bl);
     }
 
-#ifdef HAVE_LIBZBD
     if (bdev->is_smr()) {
-      {
-	bufferlist bl;
-	encode((uint64_t)zone_size, bl);
-	t->set(PREFIX_SUPER, "zone_size", bl);
-      }
-      {
-	bufferlist bl;
-	encode((uint64_t)first_sequential_zone, bl);
-	t->set(PREFIX_SUPER, "first_sequential_zone", bl);
-      }
+      _zoned_mkfs_super(t);
     }
-#endif
     
     ondisk_format = latest_ondisk_format;
     _prepare_ondisk_format_super(t);
@@ -6177,11 +6069,9 @@ int BlueStore::_mount()
     }
   });
 
-#ifdef HAVE_LIBZBD
   if (bdev->is_smr()) {
     _zoned_cleaner_start();
   }
-#endif
 
   mempool_thread.init();
 
@@ -6223,12 +6113,10 @@ int BlueStore::umount()
 
   if (!_kv_only) {
     mempool_thread.shutdown();
-#ifdef HAVE_LIBZBD
     if (bdev->is_smr()) {
       dout(20) << __func__ << " stopping zone cleaner thread" << dendl;
       _zoned_cleaner_stop();
     }
-#endif
     dout(20) << __func__ << " stopping kv thread" << dendl;
     _kv_stop();
     // skip cache cleanup step on fast shutdown
@@ -6708,21 +6596,9 @@ BlueStore::OnodeRef BlueStore::fsck_check_objects_shallow(
     ceph_assert(l.blob);
     const bluestore_blob_t& blob = l.blob->get_blob();
 
-#ifdef HAVE_LIBZBD
     if (bdev->is_smr() && depth != FSCK_SHALLOW) {
-      for (auto& e : blob.get_extents()) {
-	if (e.is_valid()) {
-	  uint32_t zone = e.offset / zone_size;
-	  uint64_t offset = e.offset % zone_size;
-	  auto p = zone_first_offsets.find(zone);
-	  if (p == zone_first_offsets.end() || p->second > offset) {
-	    // FIXME: use interator for guided insert?
-	    zone_first_offsets[zone] = offset;
-	  }
-	}
-      }
+      _zoned_fsck_note_blob(blob, zone_first_offsets);
     }
-#endif
 
     auto& ref = ref_map[l.blob];
     if (ref.is_empty()) {
@@ -6859,32 +6735,9 @@ BlueStore::OnodeRef BlueStore::fsck_check_objects_shallow(
       }
     }
 
-#ifdef HAVE_LIBZBD
     if (bdev->is_smr() && depth != FSCK_SHALLOW) {
-      for (auto& [zone, first_offset] : zone_first_offsets) {
-	auto p = (*ctx.zone_refs)[zone].find(oid);
-	if (p != (*ctx.zone_refs)[zone].end()) {
-	  if (first_offset < p->second) {
-	    dout(20) << " slightly wonky zone ref 0x" << std::hex << zone
-		 << " offset 0x" << p->second
-		 << " but first offset is 0x" << first_offset
-		 << "; this can happen due to clone_range"
-		 << dendl;
-	  } else {
-	    dout(20) << " good zone ref 0x" << std::hex << zone << " offset 0x" << p->second
-		     << " <= first offset 0x" << first_offset
-		     << std::dec << dendl;
-	  }
-	  (*ctx.zone_refs)[zone].erase(p);
-	} else {
-	  derr << "fsck error: " << oid << " references zone 0x" << std::hex << zone
-	       << " but there is no zone ref" << std::dec << dendl;
-	  // FIXME: add repair
-	  ++errors;
-	}
-      }
+      _zoned_fsck_check_refs(oid, zone_first_offsets, ctx, errors);
     }
-#endif
 
     if (broken) {
       derr << "fsck error: " << oid << " - " << broken
@@ -7865,68 +7718,9 @@ int BlueStore::_fsck_on_open(BlueStore::FSCKDepth depth, bool repair, bluestore_
     goto out_scan;
   }
 
-#ifdef HAVE_LIBZBD
   if (bdev->is_smr()) {
-    auto a = dynamic_cast<ZonedAllocator*>(alloc);
-    ceph_assert(a);
-    auto f = dynamic_cast<ZonedFreelistManager*>(fm);
-    ceph_assert(f);
-    vector<uint64_t> wp = bdev->get_zones();
-    vector<zone_state_t> zones = f->get_zone_states(db);
-    ceph_assert(wp.size() == zones.size());
-    auto num_zones = bdev->get_size() / zone_size;
-    for (unsigned i = first_sequential_zone; i < num_zones; ++i) {
-      uint64_t p = wp[i] == (i + 1) * zone_size ? zone_size : wp[i] % zone_size;
-      if (zones[i].write_pointer > p &&
-	  zones[i].num_dead_bytes < zones[i].write_pointer) {
-	derr << "fsck error: zone 0x" << std::hex << i
-	     << " bluestore write pointer 0x" << zones[i].write_pointer
-	     << " > device write pointer 0x" << p
-	     << " (with only 0x" << zones[i].num_dead_bytes << " dead bytes)"
-	     << std::dec << dendl;
-	++errors;
-      }
-    }
-
-    if (depth != FSCK_SHALLOW) {
-      // load zone refs
-      zone_refs.resize(bdev->get_size() / zone_size);
-      it = db->get_iterator(PREFIX_ZONED_CL_INFO, KeyValueDB::ITERATOR_NOCACHE);
-      if (it) {
-	for (it->lower_bound(string());
-	     it->valid();
-	     it->next()) {
-	  uint32_t zone = 0;
-	  uint64_t offset = 0;
-	  ghobject_t oid;
-	  string key = it->key();
-	  int r = get_key_zone_offset_object(key, &zone, &offset, &oid);
-	  if (r < 0) {
-	    derr << "fsck error: invalid zone ref key " << pretty_binary_string(key)
-		 << dendl;
-	    if (repair) {
-	      repairer.remove_key(db, PREFIX_ZONED_CL_INFO, key);
-	    }
-	    ++errors;
-	    continue;
-	  }
-	  dout(30) << " zone ref 0x" << std::hex << zone << " offset 0x" << offset
-		   << " -> " << std::dec << oid << dendl;
-	  if (zone_refs[zone].count(oid)) {
-	    derr << "fsck error: second zone ref in zone 0x" << std::hex << zone
-		 << " offset 0x" << offset << std::dec << " for " << oid << dendl;
-	    if (repair) {
-	      repairer.remove_key(db, PREFIX_ZONED_CL_INFO, key);
-	    }
-	    ++errors;
-	    continue;
-	  }
-	  zone_refs[zone][oid] = offset;
-	}
-      }
-    }
+    _zoned_fsck_load(depth, repair, repairer, zone_refs, errors);
   }
-#endif
 
   dout(1) << __func__ << " checking shared_blobs (phase 1)" << dendl;
   it = db->get_iterator(PREFIX_SHARED_BLOB, KeyValueDB::ITERATOR_NOCACHE);
@@ -7993,7 +7787,6 @@ int BlueStore::_fsck_on_open(BlueStore::FSCKDepth depth, bool repair, bluestore_
     _fsck_check_objects(depth, ctx);
   }
 
-#ifdef HAVE_LIBZBD
   if (bdev->is_smr() && depth != FSCK_SHALLOW) {
     dout(1) << __func__ << " checking for leaked zone refs" << dendl;
     for (uint32_t zone = 0; zone < zone_refs.size(); ++zone) {
@@ -8005,7 +7798,6 @@ int BlueStore::_fsck_on_open(BlueStore::FSCKDepth depth, bool repair, bluestore_
       }
     }
   }
-#endif
 
   sb_ref_mismatches = sb_ref_counts.count_non_zero();
   if (sb_ref_mismatches != 0) {
@@ -8484,78 +8276,9 @@ int BlueStore::_fsck_on_open(BlueStore::FSCKDepth depth, bool repair, bluestore_
     // skip freelist vs allocated compare when we have Null fm
     if (!fm->is_null_manager()) {
       dout(1) << __func__ << " checking freelist vs allocated" << dendl;
-#ifdef HAVE_LIBZBD
       if (freelist_type == "zoned") {
-	// verify per-zone state
-	//  - verify no allocations beyond write pointer
-	//  - verify num_dead_bytes count (neither allocated nor
-	//    free space past the write pointer)
-	auto a = dynamic_cast<ZonedAllocator*>(alloc);
-	auto num_zones = bdev->get_size() / zone_size;
-
-	// mark the free space past the write pointer
-	for (uint32_t zone = first_sequential_zone; zone < num_zones; ++zone) {
-	  auto wp = a->get_write_pointer(zone);
-	  uint64_t offset = zone_size * zone + wp;
-	  uint64_t length = zone_size - wp;
-	  if (!length) {
-	    continue;
-	  }
-	  bool intersects = false;
-	  dout(10) << "  marking zone 0x" << std::hex << zone
-		   << " region after wp 0x" << offset << "~" << length
-		   << std::dec << dendl;
-	  apply_for_bitset_range(
-	    offset, length, alloc_size, used_blocks,
-	    [&](uint64_t pos, mempool_dynamic_bitset &bs) {
-	      if (bs.test(pos)) {
-		derr << "fsck error: zone 0x" << std::hex << zone
-		     << " has used space at 0x" << pos * alloc_size
-		     << " beyond write pointer 0x" << wp
-		     << std::dec << dendl;
-		intersects = true;
-	      } else {
-		bs.set(pos);
-	      }
-	    }
-	    );
-	  if (intersects) {
-	    ++errors;
-	  }
-	}
-
-	used_blocks.flip();
-
-	// skip conventional zones
-	uint64_t pos = (first_sequential_zone * zone_size) / min_alloc_size - 1;
-	pos = used_blocks.find_next(pos);
-
-	uint64_t zone_dead = 0;
-	for (uint32_t zone = first_sequential_zone;
-	     zone < num_zones;
-	     ++zone, zone_dead = 0) {
-	  while (pos != decltype(used_blocks)::npos &&
-		 (pos * min_alloc_size) / zone_size == zone) {
-	    dout(40) << " zone 0x" << std::hex << zone
-		     << " dead 0x" << (pos * min_alloc_size) << "~" << min_alloc_size
-		     << std::dec << dendl;
-	    zone_dead += min_alloc_size;
-	    pos = used_blocks.find_next(pos);
-	  }
-	  dout(20) << " zone 0x" << std::hex << zone << " dead is 0x" << zone_dead
-		   << std::dec << dendl;
-	  // cross-check dead bytes against zone state
-	  if (a->get_dead_bytes(zone) != zone_dead) {
-	    derr << "fsck error: zone 0x" << std::hex << zone << " has 0x" << zone_dead
-		 << " dead bytes but freelist says 0x" << a->get_dead_bytes(zone)
-		 << dendl;
-	    ++errors;
-	    // TODO: repair
-	  }
-	}
-	used_blocks.flip();
+	_zoned_fsck_check_zones(used_blocks, alloc_size, errors);
       } else
-#endif
       {
 	if (!bdev->supported_bdev_label()) {
 	  // it should be 0 labels if labels are not supported
@@ -11838,28 +11561,9 @@ void BlueStore::_txc_finalize_kv(TransContext *txc, KeyValueDB::Transaction t)
     }
   }
 
-#ifdef HAVE_LIBZBD
   if (bdev->is_smr()) {
-    for (auto& i : txc->old_zone_offset_refs) {
-      dout(20) << __func__ << " rm ref zone 0x" << std::hex << i.first.second
-	       << " offset 0x" << i.second << std::dec
-	       << " -> " << i.first.first->oid << dendl;
-      string key;
-      get_zone_offset_object_key(i.first.second, i.second, i.first.first->oid, &key);
-      txc->t->rmkey(PREFIX_ZONED_CL_INFO, key);
-    }
-    for (auto& i : txc->new_zone_offset_refs) {
-      // (zone, offset) -> oid
-      dout(20) << __func__ << " add ref zone 0x" << std::hex << i.first.second
-	       << " offset 0x" << i.second << std::dec
-	       << " -> " << i.first.first->oid << dendl;
-      string key;
-      get_zone_offset_object_key(i.first.second, i.second, i.first.first->oid, &key);
-      bufferlist v;
-      txc->t->set(PREFIX_ZONED_CL_INFO, key, v);
-    }
+    _zoned_txc_finalize_kv(txc);
   }
-#endif
 
   _txc_update_store_statfs(txc);
 }
@@ -12593,211 +12297,6 @@ void BlueStore::_kv_finalize_thread()
   dout(10) << __func__ << " finish" << dendl;
   kv_finalize_started = false;
 }
-
-#ifdef HAVE_LIBZBD
-void BlueStore::_zoned_cleaner_start()
-{
-  dout(10) << __func__ << dendl;
-  zoned_cleaner_thread.create("bstore_zcleaner");
-}
-
-void BlueStore::_zoned_cleaner_stop()
-{
-  dout(10) << __func__ << dendl;
-  {
-    std::unique_lock l{zoned_cleaner_lock};
-    while (!zoned_cleaner_started) {
-      zoned_cleaner_cond.wait(l);
-    }
-    zoned_cleaner_stop = true;
-    zoned_cleaner_cond.notify_all();
-  }
-  zoned_cleaner_thread.join();
-  {
-    std::lock_guard l{zoned_cleaner_lock};
-    zoned_cleaner_stop = false;
-  }
-  dout(10) << __func__ << " done" << dendl;
-}
-
-void BlueStore::_zoned_cleaner_thread()
-{
-  dout(10) << __func__ << " start" << dendl;
-  std::unique_lock l{zoned_cleaner_lock};
-  ceph_assert(!zoned_cleaner_started);
-  zoned_cleaner_started = true;
-  zoned_cleaner_cond.notify_all();
-  auto a = dynamic_cast<ZonedAllocator*>(alloc);
-  ceph_assert(a);
-  auto f = dynamic_cast<ZonedFreelistManager*>(fm);
-  ceph_assert(f);
-  while (true) {
-    // thresholds to trigger cleaning
-    // FIXME
-    float min_score = .05;                // score: bytes saved / bytes moved
-    uint64_t min_saved = zone_size / 32;  // min bytes saved to consider cleaning
-    auto zone_to_clean = a->pick_zone_to_clean(min_score, min_saved);
-    if (zone_to_clean < 0) {
-      if (zoned_cleaner_stop) {
-	break;
-      }
-      auto period = ceph::make_timespan(cct->_conf->bluestore_cleaner_sleep_interval);
-      dout(20) << __func__ << " sleep for " << period << dendl;
-      zoned_cleaner_cond.wait_for(l, period);
-      dout(20) << __func__ << " wake" << dendl;
-    } else {
-      l.unlock();
-      a->set_cleaning_zone(zone_to_clean);
-      _zoned_clean_zone(zone_to_clean, a, f);
-      a->clear_cleaning_zone(zone_to_clean);
-      l.lock();
-    }
-  }
-  dout(10) << __func__ << " finish" << dendl;
-  zoned_cleaner_started = false;
-}
-
-void BlueStore::_zoned_clean_zone(
-  uint64_t zone,
-  ZonedAllocator *a,
-  ZonedFreelistManager *f
-  )
-{
-  dout(10) << __func__ << " cleaning zone 0x" << std::hex << zone << std::dec << dendl;
-
-  KeyValueDB::Iterator it = db->get_iterator(PREFIX_ZONED_CL_INFO);
-  std::string zone_start;
-  get_zone_offset_object_key(zone, 0, ghobject_t(), &zone_start);
-  for (it->lower_bound(zone_start); it->valid(); it->next()) {
-    uint32_t z;
-    uint64_t offset;
-    ghobject_t oid;
-    string k = it->key();
-    int r = get_key_zone_offset_object(k, &z, &offset, &oid);
-    if (r < 0) {
-      derr << __func__ << " failed to decode zone ref " << pretty_binary_string(k)
-	   << dendl;
-      continue;
-    }
-    if (zone != z) {
-      dout(10) << __func__ << " reached end of zone refs" << dendl;
-      break;
-    }
-    dout(10) << __func__ << " zone 0x" << std::hex << zone << " offset 0x" << offset
-	     << std::dec << " " << oid << dendl;
-    _clean_some(oid, zone);
-  }
-
-  if (a->get_live_bytes(zone) > 0) {
-    derr << "zone 0x" << std::hex << zone << " still has 0x" << a->get_live_bytes(zone)
-	 << " live bytes" << std::dec << dendl;
-    // should we do something else here to avoid a live-lock in the event of a problem?
-    return;
-  }
-
-  // make sure transactions flush/drain/commit (and data is all rewritten
-  // safely elsewhere) before we blow away the cleaned zone
-  _osr_drain_all();
-
-  // reset the device zone
-  dout(10) << __func__ << " resetting zone 0x" << std::hex << zone << std::dec << dendl;
-  bdev->reset_zone(zone);
-
-  // record that we can now write there
-  f->mark_zone_to_clean_free(zone, db);
-  bdev->flush();
-
-  // then allow ourselves to start allocating there
-  dout(10) << __func__ << " done cleaning zone 0x" << std::hex << zone << std::dec
-	   << dendl;
-  a->reset_zone(zone);
-}
-
-void BlueStore::_clean_some(ghobject_t oid, uint32_t zone)
-{
-  dout(10) << __func__ << " " << oid << " from zone 0x" << std::hex << zone << std::dec
-	   << dendl;
-
-  CollectionRef cref = _get_collection_by_oid(oid);
-  if (!cref) {
-    dout(10) << __func__ << " can't find collection for " << oid << dendl;
-    return;
-  }
-  Collection *c = cref.get();
-
-  // serialize io dispatch vs other transactions
-  std::lock_guard l(atomic_alloc_and_submit_lock);
-  std::unique_lock l2(c->lock);
-
-  auto o = c->get_onode(oid, false);
-  if (!o) {
-    dout(10) << __func__ << " can't find " << oid << dendl;
-    return;
-  }
-
-  o->extent_map.fault_range(db, 0, OBJECT_MAX_SIZE);
-  _dump_onode<30>(cct, *o);
-
-  // NOTE: This is a naive rewrite strategy.  If any blobs are
-  // shared, they will be duplicated for each object that references
-  // them.  That means any cloned/snapshotted objects will explode
-  // their utilization.  This won't matter for RGW workloads, but
-  // for RBD and CephFS it is completely unacceptable, and it's
-  // entirely reasonable to have "archival" data workloads on SMR
-  // for CephFS and (possibly/probably) RBD.
-  //
-  // At some point we need to replace this with something more
-  // sophisticated that ensures that a shared blob gets moved once
-  // and all referencing objects get updated to point to the new
-  // location.
-
-  map<uint32_t, uint32_t> to_move;
-  for (auto& e : o->extent_map.extent_map) {
-    bool touches_zone = false;
-    for (auto& be : e.blob->get_blob().get_extents()) {
-      if (be.is_valid()) {
-	uint32_t z = be.offset / zone_size;
-	if (z == zone) {
-	  touches_zone = true;
-	  break;
-	}
-      }
-    }
-    if (touches_zone) {
-      to_move[e.logical_offset] = e.length;
-    }
-  }
-  if (to_move.empty()) {
-    dout(10) << __func__ << " no references to zone 0x" << std::hex << zone
-	     << std::dec << " from " << oid << dendl;
-    return;
-  }
-
-  dout(10) << __func__ << " rewriting object extents 0x" << std::hex << to_move
-	   << std::dec << dendl;
-  OpSequencer *osr = c->osr.get();
-  TransContext *txc = _txc_create(c, osr, nullptr);
-
-  spg_t pgid;
-  if (c->cid.is_pg(&pgid)) {
-    txc->osd_pool_id = pgid.pool();
-  }
-
-  for (auto& [offset, length] : to_move) {
-    bufferlist bl;
-    int r = _do_read(c, o, offset, length, bl, 0);
-    ceph_assert(r == (int)length);
-
-    r = _do_write(txc, cref, o, offset, length, bl, 0);
-    ceph_assert(r >= 0);
-  }
-  txc->write_onode(o);
-
-  _txc_write_nodes(txc, txc->t);
-  _txc_finalize_kv(txc, txc->t);
-  _txc_state_proc(txc);
-}
-#endif
 
 bluestore_deferred_op_t *BlueStore::_get_deferred_op(
   TransContext *txc, uint64_t len)
@@ -13780,7 +13279,6 @@ void BlueStore::_do_write_small(
   // than 'offset' only).
   o->extent_map.fault_range(db, min_off, offset + max_bsize - min_off);
 
-#ifdef HAVE_LIBZBD
   // On zoned devices, the first goal is to support non-overwrite workloads,
   // such as RGW, with large, aligned objects.  Therefore, for user writes
   // _do_write_small should not trigger.  OSDs, however, write and update a tiny
@@ -13788,27 +13286,9 @@ void BlueStore::_do_write_small(
   // temporarily just pad them to min_alloc_size and write them to a new place
   // on every update.
   if (bdev->is_smr()) {
-    uint64_t b_off = p2phase<uint64_t>(offset, alloc_len);
-    uint64_t b_off0 = b_off;
-    o->extent_map.punch_hole(c, offset, length, &wctx->old_extents);
-
-    // Zero detection -- small block
-    if (!cct->_conf->bluestore_zero_block_detection || !bl.is_zero()) {
-      BlobRef b = c->new_blob();
-      _pad_zeros(&bl, &b_off0, min_alloc_size);
-      wctx->write(offset, b, alloc_len, b_off0, bl, b_off, length, false, true);
-    } else { // if (bl.is_zero())
-      dout(20) << __func__ << " skip small zero block " << std::hex
-        << " (0x" << b_off0 << "~" << bl.length() << ")"
-        << " (0x" << b_off << "~" << length << ")"
-        << std::dec << dendl;
-      logger->inc(l_bluestore_write_small_skipped);
-      logger->inc(l_bluestore_write_small_skipped_bytes, length);
-    }
-
+    _zoned_do_write_small(c, o, offset, length, alloc_len, bl, wctx);
     return;
   }
-#endif
 
   if (!wctx->full_write) {
     alloc_len = _do_write_small_with_maybe_blob_reuse(txc,
@@ -14767,26 +14247,11 @@ void BlueStore::_wctx_finish(
   WriteContext *wctx,
   set<SharedBlob*> *maybe_unshared_blobs)
 {
-#ifdef HAVE_LIBZBD
   bool is_smr = bdev && bdev->is_smr();
   if (is_smr) {
-    for (auto& w : wctx->writes) {
-      for (auto& e : w.b->get_blob().get_extents()) {
-	if (!e.is_valid()) {
-	  continue;
-	}
-	uint32_t zone = e.offset / zone_size;
-	if (!o->onode.zone_offset_refs.count(zone)) {
-	  uint64_t zoff = e.offset % zone_size;
-	  dout(20) << __func__ << " add ref zone 0x" << std::hex << zone
-		   << " offset 0x" << zoff << std::dec << dendl;
-	  txc->note_write_zone_offset(o, zone, zoff);
-	}
-      }
-    }
+    _zoned_wctx_note_writes(txc, o, wctx);
   }
   set<uint32_t> zones_with_releases;
-#endif
 
   auto oep = wctx->old_extents.begin();
   while (oep != wctx->old_extents.end()) {
@@ -14815,12 +14280,10 @@ void BlueStore::_wctx_finish(
 	  b->get_shared_blob()->put_ref(
 	    e.offset, e.length, &final,
 	    unshare_ptr);
-#ifdef HAVE_LIBZBD
 	  // we also drop zone ref for shared blob extents
 	  if (is_smr && e.is_valid()) {
 	    zones_with_releases.insert(e.offset / zone_size);
 	  }
-#endif
 	}
 	if (unshare) {
 	  ceph_assert(maybe_unshared_blobs);
@@ -14842,11 +14305,9 @@ void BlueStore::_wctx_finish(
       if (blob.is_compressed()) {
         txc->statfs_delta.compressed_allocated() -= e.length;
       }
-#ifdef HAVE_LIBZBD
       if (is_smr && e.is_valid()) {
 	zones_with_releases.insert(e.offset / zone_size);
       }
-#endif
     }
 
     if (b->is_spanning() && !b->is_referenced() && lo.blob_empty) {
@@ -14857,28 +14318,9 @@ void BlueStore::_wctx_finish(
     delete &lo;
   }
 
-#ifdef HAVE_LIBZBD
   if (!zones_with_releases.empty()) {
-    // we need to fault the entire extent range in here to determinte if we've dropped
-    // all refs to a zone.
-    o->extent_map.fault_range(db, 0, OBJECT_MAX_SIZE);
-    for (auto& b : o->extent_map.extent_map) {
-      for (auto& e : b.blob->get_blob().get_extents()) {
-	if (e.is_valid()) {
-	  zones_with_releases.erase(e.offset / zone_size);
-	}
-      }
-    }
-    for (auto zone : zones_with_releases) {
-      auto p = o->onode.zone_offset_refs.find(zone);
-      if (p != o->onode.zone_offset_refs.end()) {
-	dout(20) << __func__ << " rm ref zone 0x" << std::hex << zone
-		 << " offset 0x" << p->second << std::dec << dendl;
-	txc->note_release_zone_offset(o, zone, p->second);
-      }
-    }
+    _zoned_wctx_drop_refs(txc, o, zones_with_releases);
   }
-#endif
 }
 
 void BlueStore::_do_write_data(
@@ -16067,36 +15509,9 @@ int BlueStore::_do_clone_range(
     oldo->extent_map.dup(this, txc, c, oldo, newo, srcoff, length, dstoff);
   }
 
-#ifdef HAVE_LIBZBD
   if (bdev->is_smr()) {
-    // duplicate the refs for the shared region.
-    Extent dummy(dstoff);
-    for (auto e = newo->extent_map.extent_map.lower_bound(dummy);
-	 e != newo->extent_map.extent_map.end();
-	 ++e) {
-      if (e->logical_offset >= dstoff + length) {
-	break;
-      }
-      for (auto& ex : e->blob->get_blob().get_extents()) {
-	// note that we may introduce a new extent reference that is
-	// earlier than the first zone ref.  we allow this since it is
-	// a lot of work to avoid and has marginal impact on cleaning
-	// performance.
-	if (!ex.is_valid()) {
-	  continue;
-	}
-	uint32_t zone = ex.offset / zone_size;
-	if (!newo->onode.zone_offset_refs.count(zone)) {
-	  uint64_t zoff = ex.offset % zone_size;
-	  dout(20) << __func__ << " add ref zone 0x" << std::hex << zone
-		   << " offset 0x" << zoff << std::dec
-		   << " -> " << newo->oid << dendl;
-	  txc->note_write_zone_offset(newo, zone, zoff);
-	}
-      }
-    }
+    _zoned_clone_range_refs(txc, newo, dstoff, length);
   }
-#endif
 
   _dump_onode<30>(cct, *oldo);
   _dump_onode<30>(cct, *newo);
@@ -16204,26 +15619,9 @@ int BlueStore::_rename(TransContext *txc,
   // and read newo's metadata via the old name).
   txc->note_modified_object(oldo);
 
-#ifdef HAVE_LIBZBD
   if (bdev->is_smr()) {
-    // adjust zone refs
-    for (auto& [zone, offset] : newo->onode.zone_offset_refs) {
-      dout(20) << __func__ << " rm ref zone 0x" << std::hex << zone
-	       << " offset 0x" << offset << std::dec
-	       << " -> " << oldo->oid << dendl;
-      string key;
-      get_zone_offset_object_key(zone, offset, oldo->oid, &key);
-      txc->t->rmkey(PREFIX_ZONED_CL_INFO, key);
-
-      dout(20) << __func__ << " add ref zone 0x" << std::hex << zone
-	       << " offset 0x" << offset << std::dec
-	       << " -> " << newo->oid << dendl;
-      get_zone_offset_object_key(zone, offset, newo->oid, &key);
-      bufferlist v;
-      txc->t->set(PREFIX_ZONED_CL_INFO, key, v);
-    }
+    _zoned_rename_refs(txc, oldo, newo);
   }
-#endif
 
  out:
   logger->tinc_with_max(l_bluestore_rename_lat, mono_clock::now() - start);
