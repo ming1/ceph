@@ -12827,10 +12827,7 @@ TEST_P(StoreTest, FixSMRWritePointer) {
   int r = store->umount();
   ASSERT_EQ(0, r);
 
-  // copied from StoreTestFixture
-  std::string path = GetParam() + ".test_temp_dir"s;
-
-  std::string p = path + "/block";
+  std::string p = data_dir + "/block";
   BlockDevice* bdev = BlockDevice::create(g_ceph_context, p, nullptr, nullptr, nullptr, nullptr);
   r = bdev->open(p);
   ASSERT_EQ(0, r);
