@@ -12689,8 +12689,14 @@ int BlueStore::queue_transactions(
   // writes to the drive.  This is a temporary solution until ZONE APPEND
   // support matures in the kernel.  For more information please see:
   // https://www.usenix.org/conference/vault20/presentation/bjorling
+  //
+  // The guard also releases the lock when _txc_add_transaction() throws
+  // (objectstore_debug_throw_on_failed_txc), so the next writer is not
+  // blocked forever.
+  std::unique_lock atomic_alloc_and_submit_guard(
+    zoned.atomic_alloc_and_submit_lock, std::defer_lock);
   if (bdev->is_smr()) {
-    zoned.atomic_alloc_and_submit_lock.lock();
+    atomic_alloc_and_submit_guard.lock();
   }
 
   // prepare
@@ -12758,8 +12764,8 @@ int BlueStore::queue_transactions(
   // execute (start)
   _txc_state_proc(txc);
 
-  if (bdev->is_smr()) {
-    zoned.atomic_alloc_and_submit_lock.unlock();
+  if (atomic_alloc_and_submit_guard.owns_lock()) {
+    atomic_alloc_and_submit_guard.unlock();
   }
 
   // we're immediately readable (unlike FileStore)
