@@ -20,6 +20,7 @@
 // BlueStoreZoned as a data member.  So nothing here can use a type that is
 // nested in BlueStore.
 
+#include <functional>
 #include <map>
 #include <set>
 #include <string>
@@ -92,6 +93,11 @@ class BlueStoreZoned {
     );
   void clean_some(ghobject_t oid, uint32_t zone);
 
+  /// fsck repair: f corrects the state of one zone in the freelist
+  void fsck_fix_zone_state(
+    BlueStoreRepairer *repairer,
+    std::function<void(KeyValueDB::Transaction)> f);
+
 public:
   explicit BlueStoreZoned(BlueStore *bstore)
     : bstore(bstore), zoned_cleaner_thread(this) {}
@@ -117,9 +123,14 @@ public:
     const bluestore_blob_t& blob,
     std::map<uint32_t, uint64_t>& zone_first_offsets);
   void fsck_check_refs(
-    const ghobject_t& oid,
+    OnodeRef& o,
     const std::map<uint32_t, uint64_t>& zone_first_offsets,
     std::vector<std::unordered_map<ghobject_t, uint64_t>> *zone_refs,
+    BlueStoreRepairer *repairer,
+    int64_t& errors);
+  void fsck_check_stray_refs(
+    const std::vector<std::unordered_map<ghobject_t, uint64_t>>& zone_refs,
+    BlueStoreRepairer* repairer,
     int64_t& errors);
   void fsck_load(
     bool shallow,
@@ -130,6 +141,7 @@ public:
   void fsck_check_zones(
     mempool_dynamic_bitset& used_blocks,
     uint64_t alloc_size,
+    BlueStoreRepairer* repairer,
     int64_t& errors);
   void txc_finalize_kv(TransContext *txc);
   void cleaner_start();
@@ -219,9 +231,18 @@ inline void BlueStoreZoned::fsck_note_blob(
 }
 
 inline void BlueStoreZoned::fsck_check_refs(
-  const ghobject_t& oid,
+  OnodeRef& o,
   const std::map<uint32_t, uint64_t>& zone_first_offsets,
   std::vector<std::unordered_map<ghobject_t, uint64_t>> *zone_refs,
+  BlueStoreRepairer *repairer,
+  int64_t& errors)
+{
+  BLUESTORE_ZONED_STUB;
+}
+
+inline void BlueStoreZoned::fsck_check_stray_refs(
+  const std::vector<std::unordered_map<ghobject_t, uint64_t>>& zone_refs,
+  BlueStoreRepairer* repairer,
   int64_t& errors)
 {
   BLUESTORE_ZONED_STUB;
@@ -240,6 +261,7 @@ inline void BlueStoreZoned::fsck_load(
 inline void BlueStoreZoned::fsck_check_zones(
   mempool_dynamic_bitset& used_blocks,
   uint64_t alloc_size,
+  BlueStoreRepairer* repairer,
   int64_t& errors)
 {
   BLUESTORE_ZONED_STUB;

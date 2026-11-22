@@ -2652,6 +2652,10 @@ public:
 
 class BlueStoreRepairer
 {
+  // the zoned fsck queues its freelist fixes itself, see
+  // BlueStoreZoned::fsck_fix_zone_state()
+  friend class BlueStoreZoned;
+
   ceph::mutex lock = ceph::make_mutex("BlueStore::BlueStoreRepairer::lock");
 
 public:
