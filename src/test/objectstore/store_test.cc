@@ -12652,6 +12652,12 @@ TEST_P(CorruptedOnodesTest, Fsck_ToleratesCorruptionDuringAllocationRecovery)
 
 TEST_P(CorruptedOnodesTest, ColdOpen_StillAssertsOnCorruptOnode)
 {
+  if (smr) {
+    // The zoned freelist manager keeps the allocation state in the DB, so
+    // cold_open() never rebuilds it from the onodes and never decodes the
+    // corrupt one.
+    GTEST_SKIP() << "smr, skipping: no allocation recovery from onodes";
+  }
   if (death_test_reformats_store()) {
     GTEST_SKIP() << "death test would mkfs the shared block device, skipping";
   }
