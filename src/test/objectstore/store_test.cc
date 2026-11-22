@@ -7984,6 +7984,9 @@ public:
 TEST_P(DeferredWriteTest, NewData) {
   const bool print = false;
   deferred_test_t t = GetParam();
+  if (smr && t.prefer_deferred_size > 0) {
+    GTEST_SKIP() << "smr, skipping: no deferred writes on zoned devices";
+  }
   SetVal(g_conf(), "bdev_block_size", stringify(t.bdev_block_size).c_str());
   SetVal(g_conf(), "bluestore_min_alloc_size", stringify(t.min_alloc_size).c_str());
   SetVal(g_conf(), "bluestore_max_blob_size", stringify(t.max_blob_size).c_str());
@@ -8072,6 +8075,9 @@ class DeferredReplayTest : public DeferredWriteTest {
 TEST_P(DeferredReplayTest, DeferredReplay) {
   const bool print = false;
   deferred_test_t t = GetParam();
+  if (smr) {
+    GTEST_SKIP() << "smr, skipping: no deferred writes on zoned devices";
+  }
   SetVal(g_conf(), "bluestore_write_v2", "false");
   SetVal(g_conf(), "bdev_block_size", stringify(t.bdev_block_size).c_str());
   SetVal(g_conf(), "bluestore_min_alloc_size", stringify(t.min_alloc_size).c_str());
@@ -8158,6 +8164,9 @@ TEST_P(DeferredReplayTest, DeferredReplay) {
 TEST_P(DeferredReplayTest, DeferredReplayInReadOnly) {
   const bool print = false;
   deferred_test_t t = GetParam();
+  if (smr) {
+    GTEST_SKIP() << "smr, skipping: no deferred writes on zoned devices";
+  }
   SetVal(g_conf(), "bluestore_write_v2", "false");
   SetVal(g_conf(), "bdev_block_size", stringify(t.bdev_block_size).c_str());
   SetVal(g_conf(), "bluestore_min_alloc_size", stringify(t.min_alloc_size).c_str());
@@ -13920,6 +13929,9 @@ void doOverwriteDeferredTest(ObjectStore* store, bool v2) {
 TEST_P(StoreTestSpecificAUSize, OverwriteDeferredTest) {
   if (string(GetParam()) != "bluestore")
     return;
+  if (smr) {
+    GTEST_SKIP() << "smr, skipping: no deferred writes on zoned devices";
+  }
 
   // enforce 'hddd' settings to enable deferred writes
   SetVal(g_conf(), "bluestore_debug_enforce_settings", "hybrid");
@@ -13936,6 +13948,9 @@ TEST_P(StoreTestSpecificAUSize, OverwriteDeferredTest) {
 TEST_P(StoreTestSpecificAUSize, OverwriteDeferredV2Test) {
   if (string(GetParam()) != "bluestore")
     return;
+  if (smr) {
+    GTEST_SKIP() << "smr, skipping: no deferred writes on zoned devices";
+  }
 
   // enforce 'hddd' settings to enable deferred writes
   SetVal(g_conf(), "bluestore_debug_enforce_settings", "hybrid");
