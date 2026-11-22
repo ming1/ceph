@@ -12673,6 +12673,61 @@ TEST_P(CorruptedOnodesTest, Fsck_FixMissingHeadShard)
   cleanup_store();
 }
 
+TEST_P(CorruptedOnodesTest, Fsck_FixZoneRefs)
+{
+  if (!smr) {
+    GTEST_SKIP() << "not smr, skipping";
+  }
+  SetVal(g_conf(), "bluestore_debug_inject_allocation_from_file_failure", "0");
+  prepare_store();
+
+  mount();
+  BlueStore* bs = dynamic_cast<BlueStore*>(store.get());
+  ceph_assert(bs);
+  KeyValueDB* pdb = bs->get_kv();
+  // to be inline with BlueStore.cc
+  const string PREFIX_ZONED_CL_INFO = "G";
+  KeyValueDB::Iterator it = pdb->get_iterator(PREFIX_ZONED_CL_INFO);
+  int removed = 0;
+  int added = 0;
+  int doubled = 0;
+  auto trans = pdb->get_transaction();
+  for (it->seek_to_first(); it->valid(); it->next()) {
+    string key = it->key();
+    if (key.contains("my_special_object")) {
+      // this object loses its zone ref
+      trans->rmkey(PREFIX_ZONED_CL_INFO, key);
+      ++removed;
+    } else if (key.contains("aaaa_Object")) {
+      // this object gets a ref for a zone it has no data in: the key
+      // starts with the zone number, a big-endian u32
+      ASSERT_LT((unsigned char)key[3], 0xff);
+      ++key[3];
+      trans->set(PREFIX_ZONED_CL_INFO, key, bufferlist());
+      ++added;
+    } else if (key.contains("zzzz_Object")) {
+      // this object gets a second ref for the same zone: the offset, a
+      // big-endian u64, follows the zone number
+      ASSERT_LT((unsigned char)key[11], 0xff);
+      ++key[11];
+      trans->set(PREFIX_ZONED_CL_INFO, key, bufferlist());
+      ++doubled;
+    }
+  }
+  ASSERT_EQ(removed, 1);
+  ASSERT_EQ(added, 1);
+  ASSERT_EQ(doubled, 1);
+  ASSERT_EQ(pdb->submit_transaction_sync(trans), 0);
+  it.reset();
+  umount();
+
+  ASSERT_EQ(store->fsck(false), 3);
+  ASSERT_EQ(store->repair(false), 0);
+  ASSERT_EQ(store->fsck(false), 0);
+
+  cleanup_store();
+}
+
 TEST_P(CorruptedOnodesTest, Fsck_FixExtraShard)
 {
   SetVal(g_conf(), "bluestore_debug_inject_allocation_from_file_failure", "0");
