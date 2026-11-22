@@ -214,7 +214,13 @@ public:
   virtual bool is_rotational() { return rotational; }
 
   // HM-SMR-specific calls
+#if defined(HAVE_LIBZBD)
   virtual bool is_smr() const { return false; }
+#else
+  // Only HMSMRDevice is zoned, and it needs libzbd.  Without libzbd this
+  // is a constant, so the zoned branches of the callers are compiled out.
+  bool is_smr() const { return false; }
+#endif
   virtual uint64_t get_zone_size() const {
     ceph_assert(is_smr());
     return zone_size;
