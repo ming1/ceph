@@ -1991,7 +1991,7 @@ BlueStore::BlueStore(CephContext *cct,
     finisher(cct, "commit_finisher", "cfin"),
     kv_sync_thread(this),
     kv_finalize_thread(this),
-    zoned_cleaner_thread(this),
+    zoned(this),
     min_alloc_size(_min_alloc_size),
     min_alloc_size_order(std::countr_zero(_min_alloc_size)),
     mempool_thread(this)
@@ -3648,7 +3648,7 @@ int BlueStore::_open_fm(KeyValueDB::Transaction t,
     }
 
     fm->create(bdev->get_size(), alloc_size,
-	       zone_size, first_sequential_zone,
+	       zoned.zone_size, zoned.first_sequential_zone,
 	       t);
 
     auto reserved = _get_ondisk_reserved();
@@ -3744,8 +3744,8 @@ int BlueStore::_create_alloc()
     cct, allocator_type,
     bdev->get_size(),
     alloc_size,
-    zone_size,
-    first_sequential_zone,
+    zoned.zone_size,
+    zoned.first_sequential_zone,
     "block");
   if (!alloc) {
     lderr(cct) << __func__ << " failed to create " << allocator_type << " allocator"
@@ -3754,7 +3754,7 @@ int BlueStore::_create_alloc()
   }
 
   if (freelist_type == "zoned") {
-    int r = _zoned_create_shared_alloc(alloc_size);
+    int r = zoned.create_shared_alloc(alloc_size);
     if (r < 0) {
       return r;
     }
@@ -3776,7 +3776,7 @@ int BlueStore::_init_alloc(std::map<uint64_t, uint64_t> *zone_adjustments)
   ceph_assert(alloc != NULL);
 
   if (bdev->is_smr()) {
-    return _zoned_init_alloc(zone_adjustments);
+    return zoned.init_alloc(zone_adjustments);
   }
 
   uint64_t num = 0, bytes = 0;
@@ -3850,7 +3850,7 @@ void BlueStore::_post_init_alloc(const std::map<uint64_t, uint64_t>& zone_adjust
 {
   int r = 0;
   if (bdev->is_smr()) {
-    _zoned_post_init_alloc(zone_adjustments);
+    zoned.post_init_alloc(zone_adjustments);
   } else
   if (fm->is_null_manager()) {
     // Now that we load the allocation map we need to invalidate the file as new allocation won't be reflected
@@ -5132,9 +5132,7 @@ int BlueStore::mkfs()
   // choose freelist manager
   if (bdev->is_smr()) {
     freelist_type = "zoned";
-    zone_size = bdev->get_zone_size();
-    first_sequential_zone = bdev->get_conventional_region_size() / zone_size;
-    bdev->reset_all_zones();
+    zoned.mkfs_prepare();
   } else
   {
     freelist_type = "bitmap";
@@ -5190,10 +5188,8 @@ int BlueStore::mkfs()
       alloc->init_rm_free(location, size);
     }
   }
-  if (bdev->is_smr() && alloc != shared_alloc.a) {
-    shared_alloc.a->init_add_free(reserved,
-				  p2align(bdev->get_conventional_region_size(),
-					  min_alloc_size) - reserved);
+  if (bdev->is_smr()) {
+    zoned.mkfs_init_main_device(reserved);
   }
 
   r = _open_db(true);
@@ -5228,7 +5224,7 @@ int BlueStore::mkfs()
     }
 
     if (bdev->is_smr()) {
-      _zoned_mkfs_super(t);
+      zoned.mkfs_super(t);
     }
     
     ondisk_format = latest_ondisk_format;
@@ -6070,7 +6066,7 @@ int BlueStore::_mount()
   });
 
   if (bdev->is_smr()) {
-    _zoned_cleaner_start();
+    zoned.cleaner_start();
   }
 
   mempool_thread.init();
@@ -6115,7 +6111,7 @@ int BlueStore::umount()
     mempool_thread.shutdown();
     if (bdev->is_smr()) {
       dout(20) << __func__ << " stopping zone cleaner thread" << dendl;
-      _zoned_cleaner_stop();
+      zoned.cleaner_stop();
     }
     dout(20) << __func__ << " stopping kv thread" << dendl;
     _kv_stop();
@@ -6597,7 +6593,7 @@ BlueStore::OnodeRef BlueStore::fsck_check_objects_shallow(
     const bluestore_blob_t& blob = l.blob->get_blob();
 
     if (bdev->is_smr() && depth != FSCK_SHALLOW) {
-      _zoned_fsck_note_blob(blob, zone_first_offsets);
+      zoned.fsck_note_blob(blob, zone_first_offsets);
     }
 
     auto& ref = ref_map[l.blob];
@@ -6736,7 +6732,7 @@ BlueStore::OnodeRef BlueStore::fsck_check_objects_shallow(
     }
 
     if (bdev->is_smr() && depth != FSCK_SHALLOW) {
-      _zoned_fsck_check_refs(oid, zone_first_offsets, ctx, errors);
+      zoned.fsck_check_refs(oid, zone_first_offsets, ctx.zone_refs, errors);
     }
 
     if (broken) {
@@ -7719,7 +7715,7 @@ int BlueStore::_fsck_on_open(BlueStore::FSCKDepth depth, bool repair, bluestore_
   }
 
   if (bdev->is_smr()) {
-    _zoned_fsck_load(depth, repair, repairer, zone_refs, errors);
+    zoned.fsck_load(depth == FSCK_SHALLOW, repair, repairer, zone_refs, errors);
   }
 
   dout(1) << __func__ << " checking shared_blobs (phase 1)" << dendl;
@@ -8277,7 +8273,7 @@ int BlueStore::_fsck_on_open(BlueStore::FSCKDepth depth, bool repair, bluestore_
     if (!fm->is_null_manager()) {
       dout(1) << __func__ << " checking freelist vs allocated" << dendl;
       if (freelist_type == "zoned") {
-	_zoned_fsck_check_zones(used_blocks, alloc_size, errors);
+	zoned.fsck_check_zones(used_blocks, alloc_size, errors);
       } else
       {
 	if (!bdev->supported_bdev_label()) {
@@ -11094,8 +11090,8 @@ int BlueStore::_open_super_meta()
     int r = db->get(PREFIX_SUPER, "zone_size", &bl);
     if (r >= 0) {
       auto p = bl.cbegin();
-      decode(zone_size, p);
-      dout(1) << __func__ << " zone_size 0x" << std::hex << zone_size << std::dec << dendl;
+      decode(zoned.zone_size, p);
+      dout(1) << __func__ << " zone_size 0x" << std::hex << zoned.zone_size << std::dec << dendl;
       ceph_assert(bdev->is_smr());
     } else {
       ceph_assert(!bdev->is_smr());
@@ -11106,9 +11102,9 @@ int BlueStore::_open_super_meta()
     int r = db->get(PREFIX_SUPER, "first_sequential_zone", &bl);
     if (r >= 0) {
       auto p = bl.cbegin();
-      decode(first_sequential_zone, p);
+      decode(zoned.first_sequential_zone, p);
       dout(1) << __func__ << " first_sequential_zone 0x" << std::hex
-	      << first_sequential_zone << std::dec << dendl;
+	      << zoned.first_sequential_zone << std::dec << dendl;
       ceph_assert(bdev->is_smr());
     } else {
       ceph_assert(!bdev->is_smr());
@@ -11562,7 +11558,7 @@ void BlueStore::_txc_finalize_kv(TransContext *txc, KeyValueDB::Transaction t)
   }
 
   if (bdev->is_smr()) {
-    _zoned_txc_finalize_kv(txc);
+    zoned.txc_finalize_kv(txc);
   }
 
   _txc_update_store_statfs(txc);
@@ -12675,7 +12671,7 @@ int BlueStore::queue_transactions(
   // support matures in the kernel.  For more information please see:
   // https://www.usenix.org/conference/vault20/presentation/bjorling
   if (bdev->is_smr()) {
-    atomic_alloc_and_submit_lock.lock();
+    zoned.atomic_alloc_and_submit_lock.lock();
   }
 
   // prepare
@@ -12744,7 +12740,7 @@ int BlueStore::queue_transactions(
   _txc_state_proc(txc);
 
   if (bdev->is_smr()) {
-    atomic_alloc_and_submit_lock.unlock();
+    zoned.atomic_alloc_and_submit_lock.unlock();
   }
 
   // we're immediately readable (unlike FileStore)
@@ -13286,7 +13282,7 @@ void BlueStore::_do_write_small(
   // temporarily just pad them to min_alloc_size and write them to a new place
   // on every update.
   if (bdev->is_smr()) {
-    _zoned_do_write_small(c, o, offset, length, alloc_len, bl, wctx);
+    zoned.do_write_small(c, o, offset, length, alloc_len, bl, wctx);
     return;
   }
 
@@ -14249,7 +14245,7 @@ void BlueStore::_wctx_finish(
 {
   bool is_smr = bdev && bdev->is_smr();
   if (is_smr) {
-    _zoned_wctx_note_writes(txc, o, wctx);
+    zoned.wctx_note_writes(txc, o, wctx);
   }
   set<uint32_t> zones_with_releases;
 
@@ -14282,7 +14278,7 @@ void BlueStore::_wctx_finish(
 	    unshare_ptr);
 	  // we also drop zone ref for shared blob extents
 	  if (is_smr && e.is_valid()) {
-	    zones_with_releases.insert(e.offset / zone_size);
+	    zones_with_releases.insert(e.offset / zoned.zone_size);
 	  }
 	}
 	if (unshare) {
@@ -14306,7 +14302,7 @@ void BlueStore::_wctx_finish(
         txc->statfs_delta.compressed_allocated() -= e.length;
       }
       if (is_smr && e.is_valid()) {
-	zones_with_releases.insert(e.offset / zone_size);
+	zones_with_releases.insert(e.offset / zoned.zone_size);
       }
     }
 
@@ -14319,7 +14315,7 @@ void BlueStore::_wctx_finish(
   }
 
   if (!zones_with_releases.empty()) {
-    _zoned_wctx_drop_refs(txc, o, zones_with_releases);
+    zoned.wctx_drop_refs(txc, o, zones_with_releases);
   }
 }
 
@@ -15510,7 +15506,7 @@ int BlueStore::_do_clone_range(
   }
 
   if (bdev->is_smr()) {
-    _zoned_clone_range_refs(txc, newo, dstoff, length);
+    zoned.clone_range_refs(txc, newo, dstoff, length);
   }
 
   _dump_onode<30>(cct, *oldo);
@@ -15620,7 +15616,7 @@ int BlueStore::_rename(TransContext *txc,
   txc->note_modified_object(oldo);
 
   if (bdev->is_smr()) {
-    _zoned_rename_refs(txc, oldo, newo);
+    zoned.rename_refs(txc, oldo, newo);
   }
 
  out:
@@ -17277,7 +17273,7 @@ Allocator* BlueStore::create_bitmap_allocator(uint64_t bdev_size) {
   // create allocator
   uint64_t alloc_size = min_alloc_size;
   Allocator* alloc = Allocator::create(cct, "bitmap", bdev_size, alloc_size,
-				       zone_size, first_sequential_zone,
+				       zoned.zone_size, zoned.first_sequential_zone,
 				       "recovery");
   if (alloc) {
     return alloc;

@@ -58,6 +58,7 @@
 
 #include "bluestore_types.h"
 #include "BlueStore_fwd.h"
+#include "BlueStoreZoned.h"
 #include "BlueFS.h"
 #include "common/EventTrace.h"
 #include "common/admin_socket.h"
@@ -372,6 +373,7 @@ public:
 
   class Writer;
   friend class Writer;
+  friend class BlueStoreZoned;
 
   class SocketHook;
   friend class SocketHook;
@@ -893,15 +895,6 @@ public:
     }
   };
 
-  struct ZonedCleanerThread : public Thread {
-    BlueStore *store;
-    explicit ZonedCleanerThread(BlueStore *s) : store(s) {}
-    void *entry() override {
-      store->_zoned_cleaner_thread();
-      return nullptr;
-    }
-  };
-
   // --------------------------------------------------------
   // members
 private:
@@ -1009,8 +1002,6 @@ private:
   std::atomic<uint64_t> blobid_max = {0};
 
   ceph::mutex deferred_lock = ceph::make_mutex("BlueStore::deferred_lock");
-  ceph::mutex atomic_alloc_and_submit_lock =
-      ceph::make_mutex("BlueStore::atomic_alloc_and_submit_lock");
   std::atomic<uint64_t> deferred_seq = {0};
   std::unique_ptr<deferred_osr_queue_t> deferred_queue; ///< osr's with deferred io pending
   std::atomic_int deferred_queue_size = {0};         ///< num txc's queued across all osrs
@@ -1039,12 +1030,9 @@ private:
   std::deque<DeferredBatch*> deferred_stable_to_finalize; ///< pending finalization
   bool kv_finalize_in_progress = false;
 
-  ZonedCleanerThread zoned_cleaner_thread;
-  ceph::mutex zoned_cleaner_lock = ceph::make_mutex("BlueStore::zoned_cleaner_lock");
-  ceph::condition_variable zoned_cleaner_cond;
-  bool zoned_cleaner_started = false;
-  bool zoned_cleaner_stop = false;
-  std::deque<uint64_t> zoned_cleaner_queue;
+  /// zoned devices (HM-SMR, ZNS): state and code, see BlueStoreZoned.h;
+  /// only used when bdev->is_smr()
+  BlueStoreZoned zoned;
 
   PerfCounters *logger = nullptr;
 
@@ -1071,10 +1059,6 @@ private:
   bool elastic_shared_blobs = false; ///< use smart ExtentMap::dup to reduce shared blob count
   bool use_write_v2 = false; ///< use new write path
   bool debug_extent_map_encode_check = false;
-
-  // smr-only
-  uint64_t zone_size = 0;              ///< number of SMR zones 
-  uint64_t first_sequential_zone = 0;  ///< first SMR zone that is sequential-only
 
   enum {
     // Please preserve the order since it's DB persistent
@@ -1532,14 +1516,6 @@ private:
   void _kv_stop();
   void _kv_sync_thread();
   void _kv_finalize_thread();
-
-  void _zoned_cleaner_start();
-  void _zoned_cleaner_stop();
-  void _zoned_cleaner_thread();
-  void _zoned_clean_zone(uint64_t zone_num,
-			 class ZonedAllocator *a,
-			 class ZonedFreelistManager *f);
-  void _clean_some(ghobject_t oid, uint32_t zone_num);
 
   bluestore_deferred_op_t *_get_deferred_op(TransContext *txc, uint64_t len);
   void _deferred_queue(TransContext *txc);
@@ -2659,54 +2635,6 @@ private:
   void _fsck_check_objects(FSCKDepth depth,
     FSCK_ObjectCtx& ctx);
 
-  // zoned devices: bodies of the larger zoned code paths, see BlueStoreZoned.cc
-  int _zoned_create_shared_alloc(uint64_t alloc_size);
-  int _zoned_init_alloc(std::map<uint64_t, uint64_t> *zone_adjustments);
-  void _zoned_post_init_alloc(const std::map<uint64_t, uint64_t>& zone_adjustments);
-  void _zoned_mkfs_super(KeyValueDB::Transaction& t);
-  void _zoned_fsck_note_blob(
-    const bluestore_blob_t& blob,
-    std::map<uint32_t, uint64_t>& zone_first_offsets);
-  void _zoned_fsck_check_refs(
-    const ghobject_t& oid,
-    const std::map<uint32_t, uint64_t>& zone_first_offsets,
-    const FSCK_ObjectCtx& ctx,
-    int64_t& errors);
-  void _zoned_fsck_load(
-    FSCKDepth depth,
-    bool repair,
-    BlueStoreRepairer& repairer,
-    std::vector<std::unordered_map<ghobject_t, uint64_t>>& zone_refs,
-    int64_t& errors);
-  void _zoned_fsck_check_zones(
-    mempool_dynamic_bitset& used_blocks,
-    uint64_t alloc_size,
-    int64_t& errors);
-  void _zoned_txc_finalize_kv(TransContext *txc);
-  void _zoned_do_write_small(
-    CollectionRef& c,
-    OnodeRef& o,
-    uint64_t offset, uint64_t length,
-    uint64_t alloc_len,
-    ceph::buffer::list& bl,
-    WriteContext *wctx);
-  void _zoned_wctx_note_writes(
-    TransContext *txc,
-    OnodeRef& o,
-    WriteContext *wctx);
-  void _zoned_wctx_drop_refs(
-    TransContext *txc,
-    OnodeRef& o,
-    std::set<uint32_t>& zones_with_releases);
-  void _zoned_clone_range_refs(
-    TransContext *txc,
-    OnodeRef& newo,
-    uint64_t dstoff, uint64_t length);
-  void _zoned_rename_refs(
-    TransContext *txc,
-    OnodeRef& oldo,
-    OnodeRef& newo);
-
 public:
   static int create_bdev_labels(CephContext *cct,
                           const std::string& path,
@@ -2942,8 +2870,5 @@ private:
   fsck_interval misreferenced_extents;
 
 };
-
-// zoned devices: shared helpers, and inline stubs when built without libzbd
-#include "BlueStoreZoned.h"
 
 #endif

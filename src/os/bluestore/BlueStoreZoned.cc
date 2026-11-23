@@ -12,10 +12,11 @@
 
 // BlueStore on zoned devices (HM-SMR, ZNS).
 //
-// These BlueStore member functions run only when bdev->is_smr() is true.
-// They live here so that BlueStore.cc needs almost no "#ifdef HAVE_LIBZBD".
-// This file is built only with libzbd (WITH_ZBD).  Without it no block
-// device reports is_smr(), and BlueStoreZoned.h has inline stubs instead.
+// The member functions of BlueStoreZoned.  BlueStore calls them only when
+// bdev->is_smr() is true.  They live here so that BlueStore.cc needs almost
+// no "#ifdef HAVE_LIBZBD".  This file is built only with libzbd (WITH_ZBD).
+// Without it no block device reports is_smr(), and BlueStoreZoned.h has
+// inline stubs instead.
 
 #include "BlueStore.h"
 #include "BlueStoreZoned.h"
@@ -32,10 +33,10 @@
 #include "common/pretty_binary.h"
 #include "include/intarith.h"
 
-#define dout_context cct
+#define dout_context bstore->cct
 #define dout_subsys ceph_subsys_bluestore
 #undef dout_prefix
-#define dout_prefix *_dout << "bluestore(" << path << ") "
+#define dout_prefix *_dout << "bluestore(" << bstore->path << ") "
 
 using std::min;
 using std::map;
@@ -46,36 +47,36 @@ using ceph::bufferlist;
 using ceph::decode;
 using ceph::encode;
 
-int BlueStore::_zoned_create_shared_alloc(uint64_t alloc_size)
+int BlueStoreZoned::create_shared_alloc(uint64_t alloc_size)
 {
   Allocator *a = Allocator::create(
-    cct, cct->_conf->bluestore_allocator,
-    bdev->get_conventional_region_size(),
+    bstore->cct, bstore->cct->_conf->bluestore_allocator,
+    bstore->bdev->get_conventional_region_size(),
     alloc_size,
     zone_size, 0,
     "zoned_block");
   if (!a) {
-    lderr(cct) << __func__ << " failed to create " << cct->_conf->bluestore_allocator
+    lderr(bstore->cct) << __func__ << " failed to create " << bstore->cct->_conf->bluestore_allocator
 	       << " allocator" << dendl;
-    delete alloc;
+    delete bstore->alloc;
     return -EINVAL;
   }
-  shared_alloc.set(a, alloc_size);
+  bstore->shared_alloc.set(a, alloc_size);
   return 0;
 }
 
-int BlueStore::_zoned_init_alloc(std::map<uint64_t, uint64_t> *zone_adjustments)
+int BlueStoreZoned::init_alloc(std::map<uint64_t, uint64_t> *zone_adjustments)
 {
-  auto a = dynamic_cast<ZonedAllocator*>(alloc);
+  auto a = dynamic_cast<ZonedAllocator*>(bstore->alloc);
   ceph_assert(a);
-  auto f = dynamic_cast<ZonedFreelistManager*>(fm);
+  auto f = dynamic_cast<ZonedFreelistManager*>(bstore->fm);
   ceph_assert(f);
-  vector<uint64_t> wp = bdev->get_zones();
-  vector<zone_state_t> zones = f->get_zone_states(db);
+  vector<uint64_t> wp = bstore->bdev->get_zones();
+  vector<zone_state_t> zones = f->get_zone_states(bstore->db);
   ceph_assert(wp.size() == zones.size());
 
   // reconcile zone state
-  auto num_zones = bdev->get_size() / zone_size;
+  auto num_zones = bstore->bdev->get_size() / zone_size;
   for (unsigned i = first_sequential_zone; i < num_zones; ++i) {
     ceph_assert(wp[i] >= i * zone_size);
     ceph_assert(wp[i] <= (i + 1) * zone_size); // pos might be at start of next zone
@@ -100,50 +101,69 @@ int BlueStore::_zoned_init_alloc(std::map<uint64_t, uint64_t> *zone_adjustments)
   }
 
   // start with conventional zone "free" (bluefs may adjust this when it starts up)
-  auto reserved = _get_ondisk_reserved();
+  auto reserved = bstore->_get_ondisk_reserved();
   // for now we require a conventional zone
-  ceph_assert(bdev->get_conventional_region_size());
-  ceph_assert(shared_alloc.a != alloc);  // zoned allocator doesn't use conventional region
-  shared_alloc.a->init_add_free(
+  ceph_assert(bstore->bdev->get_conventional_region_size());
+  ceph_assert(bstore->shared_alloc.a != bstore->alloc);  // zoned allocator doesn't use conventional region
+  bstore->shared_alloc.a->init_add_free(
     reserved,
-    p2align(bdev->get_conventional_region_size(), min_alloc_size) - reserved);
+    p2align(bstore->bdev->get_conventional_region_size(), bstore->min_alloc_size) - reserved);
 
   // init sequential zone based on the device's write pointers
   a->init_from_zone_pointers(std::move(zones));
   dout(1) << __func__
 	  << " loaded zone pointers: "
 	  << std::hex
-	  << ", allocator type " << alloc->get_type()
-	  << ", capacity 0x" << alloc->get_capacity()
-	  << ", block size 0x" << alloc->get_block_size()
-	  << ", free 0x" << alloc->get_free()
-	  << ", fragmentation " << alloc->get_fragmentation()
+	  << ", allocator type " << bstore->alloc->get_type()
+	  << ", capacity 0x" << bstore->alloc->get_capacity()
+	  << ", block size 0x" << bstore->alloc->get_block_size()
+	  << ", free 0x" << bstore->alloc->get_free()
+	  << ", fragmentation " << bstore->alloc->get_fragmentation()
 	  << std::dec << dendl;
 
   return 0;
 }
 
-void BlueStore::_zoned_post_init_alloc(const std::map<uint64_t, uint64_t>& zone_adjustments)
+void BlueStoreZoned::post_init_alloc(const std::map<uint64_t, uint64_t>& zone_adjustments)
 {
   int r = 0;
   if (zone_adjustments.empty()) {
     return;
   }
   dout(1) << __func__ << " adjusting freelist based on device write pointers" << dendl;
-  auto f = dynamic_cast<ZonedFreelistManager*>(fm);
+  auto f = dynamic_cast<ZonedFreelistManager*>(bstore->fm);
   ceph_assert(f);
-  KeyValueDB::Transaction t = db->get_transaction();
+  KeyValueDB::Transaction t = bstore->db->get_transaction();
   for (auto& i : zone_adjustments) {
     // allocate AND release since this gap is now dead space
     // note that the offset is imprecise, but only need to select the zone
     f->allocate(i.first, i.second, t);
     f->release(i.first, i.second, t);
   }
-  r = db->submit_transaction_sync(t);
+  r = bstore->db->submit_transaction_sync(t);
   ceph_assert(r >= 0);
 }
 
-void BlueStore::_zoned_mkfs_super(KeyValueDB::Transaction& t)
+void BlueStoreZoned::mkfs_prepare()
+{
+  auto bdev = bstore->bdev;
+  zone_size = bdev->get_zone_size();
+  first_sequential_zone = bdev->get_conventional_region_size() / zone_size;
+  bdev->reset_all_zones();
+}
+
+void BlueStoreZoned::mkfs_init_main_device(uint64_t reserved)
+{
+  auto bdev = bstore->bdev;
+  if (bstore->alloc != bstore->shared_alloc.a) {
+    bstore->shared_alloc.a->init_add_free(
+      reserved,
+      p2align(bdev->get_conventional_region_size(),
+	      bstore->min_alloc_size) - reserved);
+  }
+}
+
+void BlueStoreZoned::mkfs_super(KeyValueDB::Transaction& t)
 {
   {
     bufferlist bl;
@@ -157,7 +177,7 @@ void BlueStore::_zoned_mkfs_super(KeyValueDB::Transaction& t)
   }
 }
 
-void BlueStore::_zoned_fsck_note_blob(
+void BlueStoreZoned::fsck_note_blob(
   const bluestore_blob_t& blob,
   std::map<uint32_t, uint64_t>& zone_first_offsets)
 {
@@ -174,15 +194,15 @@ void BlueStore::_zoned_fsck_note_blob(
   }
 }
 
-void BlueStore::_zoned_fsck_check_refs(
+void BlueStoreZoned::fsck_check_refs(
   const ghobject_t& oid,
   const std::map<uint32_t, uint64_t>& zone_first_offsets,
-  const FSCK_ObjectCtx& ctx,
+  std::vector<std::unordered_map<ghobject_t, uint64_t>> *zone_refs,
   int64_t& errors)
 {
   for (auto& [zone, first_offset] : zone_first_offsets) {
-    auto p = (*ctx.zone_refs)[zone].find(oid);
-    if (p != (*ctx.zone_refs)[zone].end()) {
+    auto p = (*zone_refs)[zone].find(oid);
+    if (p != (*zone_refs)[zone].end()) {
       if (first_offset < p->second) {
 	dout(20) << " slightly wonky zone ref 0x" << std::hex << zone
 	     << " offset 0x" << p->second
@@ -194,7 +214,7 @@ void BlueStore::_zoned_fsck_check_refs(
 		 << " <= first offset 0x" << first_offset
 		 << std::dec << dendl;
       }
-      (*ctx.zone_refs)[zone].erase(p);
+      (*zone_refs)[zone].erase(p);
     } else {
       derr << "fsck error: " << oid << " references zone 0x" << std::hex << zone
 	   << " but there is no zone ref" << std::dec << dendl;
@@ -204,22 +224,22 @@ void BlueStore::_zoned_fsck_check_refs(
   }
 }
 
-void BlueStore::_zoned_fsck_load(
-  FSCKDepth depth,
+void BlueStoreZoned::fsck_load(
+  bool shallow,
   bool repair,
   BlueStoreRepairer& repairer,
   std::vector<std::unordered_map<ghobject_t, uint64_t>>& zone_refs,
   int64_t& errors)
 {
   KeyValueDB::Iterator it;
-  auto a = dynamic_cast<ZonedAllocator*>(alloc);
+  auto a = dynamic_cast<ZonedAllocator*>(bstore->alloc);
   ceph_assert(a);
-  auto f = dynamic_cast<ZonedFreelistManager*>(fm);
+  auto f = dynamic_cast<ZonedFreelistManager*>(bstore->fm);
   ceph_assert(f);
-  vector<uint64_t> wp = bdev->get_zones();
-  vector<zone_state_t> zones = f->get_zone_states(db);
+  vector<uint64_t> wp = bstore->bdev->get_zones();
+  vector<zone_state_t> zones = f->get_zone_states(bstore->db);
   ceph_assert(wp.size() == zones.size());
-  auto num_zones = bdev->get_size() / zone_size;
+  auto num_zones = bstore->bdev->get_size() / zone_size;
   for (unsigned i = first_sequential_zone; i < num_zones; ++i) {
     uint64_t p = wp[i] == (i + 1) * zone_size ? zone_size : wp[i] % zone_size;
     if (zones[i].write_pointer > p &&
@@ -233,10 +253,10 @@ void BlueStore::_zoned_fsck_load(
     }
   }
 
-  if (depth != FSCK_SHALLOW) {
+  if (!shallow) {
     // load zone refs
-    zone_refs.resize(bdev->get_size() / zone_size);
-    it = db->get_iterator(PREFIX_ZONED_CL_INFO, KeyValueDB::ITERATOR_NOCACHE);
+    zone_refs.resize(bstore->bdev->get_size() / zone_size);
+    it = bstore->db->get_iterator(PREFIX_ZONED_CL_INFO, KeyValueDB::ITERATOR_NOCACHE);
     if (it) {
       for (it->lower_bound(string());
 	   it->valid();
@@ -250,7 +270,7 @@ void BlueStore::_zoned_fsck_load(
 	  derr << "fsck error: invalid zone ref key " << pretty_binary_string(key)
 	       << dendl;
 	  if (repair) {
-	    repairer.remove_key(db, PREFIX_ZONED_CL_INFO, key);
+	    repairer.remove_key(bstore->db, PREFIX_ZONED_CL_INFO, key);
 	  }
 	  ++errors;
 	  continue;
@@ -261,7 +281,7 @@ void BlueStore::_zoned_fsck_load(
 	  derr << "fsck error: second zone ref in zone 0x" << std::hex << zone
 	       << " offset 0x" << offset << std::dec << " for " << oid << dendl;
 	  if (repair) {
-	    repairer.remove_key(db, PREFIX_ZONED_CL_INFO, key);
+	    repairer.remove_key(bstore->db, PREFIX_ZONED_CL_INFO, key);
 	  }
 	  ++errors;
 	  continue;
@@ -272,7 +292,7 @@ void BlueStore::_zoned_fsck_load(
   }
 }
 
-void BlueStore::_zoned_fsck_check_zones(
+void BlueStoreZoned::fsck_check_zones(
   mempool_dynamic_bitset& used_blocks,
   uint64_t alloc_size,
   int64_t& errors)
@@ -281,8 +301,8 @@ void BlueStore::_zoned_fsck_check_zones(
   //  - verify no allocations beyond write pointer
   //  - verify num_dead_bytes count (neither allocated nor
   //    free space past the write pointer)
-  auto a = dynamic_cast<ZonedAllocator*>(alloc);
-  auto num_zones = bdev->get_size() / zone_size;
+  auto a = dynamic_cast<ZonedAllocator*>(bstore->alloc);
+  auto num_zones = bstore->bdev->get_size() / zone_size;
 
   // mark the free space past the write pointer
   for (uint32_t zone = first_sequential_zone; zone < num_zones; ++zone) {
@@ -318,7 +338,7 @@ void BlueStore::_zoned_fsck_check_zones(
   used_blocks.flip();
 
   // skip conventional zones
-  uint64_t pos = (first_sequential_zone * zone_size) / min_alloc_size - 1;
+  uint64_t pos = (first_sequential_zone * zone_size) / bstore->min_alloc_size - 1;
   pos = used_blocks.find_next(pos);
 
   uint64_t zone_dead = 0;
@@ -326,11 +346,11 @@ void BlueStore::_zoned_fsck_check_zones(
        zone < num_zones;
        ++zone, zone_dead = 0) {
     while (pos != mempool_dynamic_bitset::npos &&
-	   (pos * min_alloc_size) / zone_size == zone) {
+	   (pos * bstore->min_alloc_size) / zone_size == zone) {
       dout(40) << " zone 0x" << std::hex << zone
-	       << " dead 0x" << (pos * min_alloc_size) << "~" << min_alloc_size
+	       << " dead 0x" << (pos * bstore->min_alloc_size) << "~" << bstore->min_alloc_size
 	       << std::dec << dendl;
-      zone_dead += min_alloc_size;
+      zone_dead += bstore->min_alloc_size;
       pos = used_blocks.find_next(pos);
     }
     dout(20) << " zone 0x" << std::hex << zone << " dead is 0x" << zone_dead
@@ -347,7 +367,7 @@ void BlueStore::_zoned_fsck_check_zones(
   used_blocks.flip();
 }
 
-void BlueStore::_zoned_txc_finalize_kv(TransContext *txc)
+void BlueStoreZoned::txc_finalize_kv(TransContext *txc)
 {
   for (auto& i : txc->old_zone_offset_refs) {
     dout(20) << __func__ << " rm ref zone 0x" << std::hex << i.first.second
@@ -369,13 +389,13 @@ void BlueStore::_zoned_txc_finalize_kv(TransContext *txc)
   }
 }
 
-void BlueStore::_zoned_cleaner_start()
+void BlueStoreZoned::cleaner_start()
 {
   dout(10) << __func__ << dendl;
   zoned_cleaner_thread.create("bstore_zcleaner");
 }
 
-void BlueStore::_zoned_cleaner_stop()
+void BlueStoreZoned::cleaner_stop()
 {
   dout(10) << __func__ << dendl;
   {
@@ -394,16 +414,16 @@ void BlueStore::_zoned_cleaner_stop()
   dout(10) << __func__ << " done" << dendl;
 }
 
-void BlueStore::_zoned_cleaner_thread()
+void BlueStoreZoned::cleaner_thread()
 {
   dout(10) << __func__ << " start" << dendl;
   std::unique_lock l{zoned_cleaner_lock};
   ceph_assert(!zoned_cleaner_started);
   zoned_cleaner_started = true;
   zoned_cleaner_cond.notify_all();
-  auto a = dynamic_cast<ZonedAllocator*>(alloc);
+  auto a = dynamic_cast<ZonedAllocator*>(bstore->alloc);
   ceph_assert(a);
-  auto f = dynamic_cast<ZonedFreelistManager*>(fm);
+  auto f = dynamic_cast<ZonedFreelistManager*>(bstore->fm);
   ceph_assert(f);
   while (true) {
     // thresholds to trigger cleaning
@@ -415,14 +435,14 @@ void BlueStore::_zoned_cleaner_thread()
       if (zoned_cleaner_stop) {
 	break;
       }
-      auto period = ceph::make_timespan(cct->_conf->bluestore_cleaner_sleep_interval);
+      auto period = ceph::make_timespan(bstore->cct->_conf->bluestore_cleaner_sleep_interval);
       dout(20) << __func__ << " sleep for " << period << dendl;
       zoned_cleaner_cond.wait_for(l, period);
       dout(20) << __func__ << " wake" << dendl;
     } else {
       l.unlock();
       a->set_cleaning_zone(zone_to_clean);
-      _zoned_clean_zone(zone_to_clean, a, f);
+      clean_zone(zone_to_clean, a, f);
       a->clear_cleaning_zone(zone_to_clean);
       l.lock();
     }
@@ -431,7 +451,7 @@ void BlueStore::_zoned_cleaner_thread()
   zoned_cleaner_started = false;
 }
 
-void BlueStore::_zoned_clean_zone(
+void BlueStoreZoned::clean_zone(
   uint64_t zone,
   ZonedAllocator *a,
   ZonedFreelistManager *f
@@ -439,7 +459,7 @@ void BlueStore::_zoned_clean_zone(
 {
   dout(10) << __func__ << " cleaning zone 0x" << std::hex << zone << std::dec << dendl;
 
-  KeyValueDB::Iterator it = db->get_iterator(PREFIX_ZONED_CL_INFO);
+  KeyValueDB::Iterator it = bstore->db->get_iterator(PREFIX_ZONED_CL_INFO);
   std::string zone_start;
   get_zone_offset_object_key(zone, 0, ghobject_t(), &zone_start);
   for (it->lower_bound(zone_start); it->valid(); it->next()) {
@@ -459,7 +479,7 @@ void BlueStore::_zoned_clean_zone(
     }
     dout(10) << __func__ << " zone 0x" << std::hex << zone << " offset 0x" << offset
 	     << std::dec << " " << oid << dendl;
-    _clean_some(oid, zone);
+    clean_some(oid, zone);
   }
 
   if (a->get_live_bytes(zone) > 0) {
@@ -471,15 +491,15 @@ void BlueStore::_zoned_clean_zone(
 
   // make sure transactions flush/drain/commit (and data is all rewritten
   // safely elsewhere) before we blow away the cleaned zone
-  _osr_drain_all();
+  bstore->_osr_drain_all();
 
   // reset the device zone
   dout(10) << __func__ << " resetting zone 0x" << std::hex << zone << std::dec << dendl;
-  bdev->reset_zone(zone);
+  bstore->bdev->reset_zone(zone);
 
   // record that we can now write there
-  f->mark_zone_to_clean_free(zone, db);
-  bdev->flush();
+  f->mark_zone_to_clean_free(zone, bstore->db);
+  bstore->bdev->flush();
 
   // then allow ourselves to start allocating there
   dout(10) << __func__ << " done cleaning zone 0x" << std::hex << zone << std::dec
@@ -487,12 +507,12 @@ void BlueStore::_zoned_clean_zone(
   a->reset_zone(zone);
 }
 
-void BlueStore::_clean_some(ghobject_t oid, uint32_t zone)
+void BlueStoreZoned::clean_some(ghobject_t oid, uint32_t zone)
 {
   dout(10) << __func__ << " " << oid << " from zone 0x" << std::hex << zone << std::dec
 	   << dendl;
 
-  CollectionRef cref = _get_collection_by_oid(oid);
+  CollectionRef cref = bstore->_get_collection_by_oid(oid);
   if (!cref) {
     dout(10) << __func__ << " can't find collection for " << oid << dendl;
     return;
@@ -509,8 +529,8 @@ void BlueStore::_clean_some(ghobject_t oid, uint32_t zone)
     return;
   }
 
-  o->extent_map.fault_range(db, 0, OBJECT_MAX_SIZE);
-  _dump_onode<30>(cct, *o);
+  o->extent_map.fault_range(bstore->db, 0, BlueStore::OBJECT_MAX_SIZE);
+  _dump_onode<30>(bstore->cct, *o);
 
   // NOTE: This is a naive rewrite strategy.  If any blobs are
   // shared, they will be duplicated for each object that references
@@ -550,7 +570,7 @@ void BlueStore::_clean_some(ghobject_t oid, uint32_t zone)
   dout(10) << __func__ << " rewriting object extents 0x" << std::hex << to_move
 	   << std::dec << dendl;
   OpSequencer *osr = c->osr.get();
-  TransContext *txc = _txc_create(c, osr, nullptr);
+  TransContext *txc = bstore->_txc_create(c, osr, nullptr);
 
   spg_t pgid;
   if (c->cid.is_pg(&pgid)) {
@@ -559,20 +579,20 @@ void BlueStore::_clean_some(ghobject_t oid, uint32_t zone)
 
   for (auto& [offset, length] : to_move) {
     bufferlist bl;
-    int r = _do_read(c, o, offset, length, bl, 0);
+    int r = bstore->_do_read(c, o, offset, length, bl, 0);
     ceph_assert(r == (int)length);
 
-    r = _do_write(txc, cref, o, offset, length, bl, 0);
+    r = bstore->_do_write(txc, cref, o, offset, length, bl, 0);
     ceph_assert(r >= 0);
   }
   txc->write_onode(o);
 
-  _txc_write_nodes(txc, txc->t);
-  _txc_finalize_kv(txc, txc->t);
-  _txc_state_proc(txc);
+  bstore->_txc_write_nodes(txc, txc->t);
+  bstore->_txc_finalize_kv(txc, txc->t);
+  bstore->_txc_state_proc(txc);
 }
 
-void BlueStore::_zoned_do_write_small(
+void BlueStoreZoned::do_write_small(
   CollectionRef& c,
   OnodeRef& o,
   uint64_t offset, uint64_t length,
@@ -585,23 +605,23 @@ void BlueStore::_zoned_do_write_small(
   o->extent_map.punch_hole(c, offset, length, &wctx->old_extents);
 
   // Zero detection -- small block
-  if (!cct->_conf->bluestore_zero_block_detection || !bl.is_zero()) {
+  if (!bstore->cct->_conf->bluestore_zero_block_detection || !bl.is_zero()) {
     BlobRef b = c->new_blob();
-    _pad_zeros(&bl, &b_off0, min_alloc_size);
+    bstore->_pad_zeros(&bl, &b_off0, bstore->min_alloc_size);
     wctx->write(offset, b, alloc_len, b_off0, bl, b_off, length, false, true);
   } else { // if (bl.is_zero())
     dout(20) << __func__ << " skip small zero block " << std::hex
       << " (0x" << b_off0 << "~" << bl.length() << ")"
       << " (0x" << b_off << "~" << length << ")"
       << std::dec << dendl;
-    logger->inc(l_bluestore_write_small_skipped);
-    logger->inc(l_bluestore_write_small_skipped_bytes, length);
+    bstore->logger->inc(l_bluestore_write_small_skipped);
+    bstore->logger->inc(l_bluestore_write_small_skipped_bytes, length);
   }
 
   return;
 }
 
-void BlueStore::_zoned_wctx_note_writes(
+void BlueStoreZoned::wctx_note_writes(
   TransContext *txc,
   OnodeRef& o,
   WriteContext *wctx)
@@ -622,14 +642,14 @@ void BlueStore::_zoned_wctx_note_writes(
   }
 }
 
-void BlueStore::_zoned_wctx_drop_refs(
+void BlueStoreZoned::wctx_drop_refs(
   TransContext *txc,
   OnodeRef& o,
   std::set<uint32_t>& zones_with_releases)
 {
   // we need to fault the entire extent range in here to determinte if we've dropped
   // all refs to a zone.
-  o->extent_map.fault_range(db, 0, OBJECT_MAX_SIZE);
+  o->extent_map.fault_range(bstore->db, 0, BlueStore::OBJECT_MAX_SIZE);
   for (auto& b : o->extent_map.extent_map) {
     for (auto& e : b.blob->get_blob().get_extents()) {
       if (e.is_valid()) {
@@ -647,7 +667,7 @@ void BlueStore::_zoned_wctx_drop_refs(
   }
 }
 
-void BlueStore::_zoned_clone_range_refs(
+void BlueStoreZoned::clone_range_refs(
   TransContext *txc,
   OnodeRef& newo,
   uint64_t dstoff, uint64_t length)
@@ -680,7 +700,7 @@ void BlueStore::_zoned_clone_range_refs(
   }
 }
 
-void BlueStore::_zoned_rename_refs(
+void BlueStoreZoned::rename_refs(
   TransContext *txc,
   OnodeRef& oldo,
   OnodeRef& newo)
