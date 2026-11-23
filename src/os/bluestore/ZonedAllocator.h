@@ -25,7 +25,7 @@ class ZonedAllocator : public AllocatorBase {
   CephContext* cct;
 
   // Currently only one thread at a time calls into ZonedAllocator due to
-  // atomic_alloc_and_submit_lock in BlueStore.cc, but we do locking anyway
+  // BlueStoreZoned::atomic_alloc_and_submit_lock, but we do locking anyway
   // because eventually ZONE_APPEND support will land and
   // atomic_alloc_and_submit_lock will be removed.
   ceph::mutex lock = ceph::make_mutex("ZonedAllocator::lock");
