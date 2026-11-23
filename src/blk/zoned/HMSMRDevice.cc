@@ -125,7 +125,14 @@ std::vector<uint64_t> HMSMRDevice::get_zones()
 
   std::vector<uint64_t> wp(num_zones);
   for (unsigned i = 0; i < num_zones; ++i) {
-    wp[i] = zones[i].wp;
+    // The write pointer of a full zone is not defined.  Some devices report
+    // the end of the zone there, others an invalid value (zloop: all ones).
+    // Callers expect the end of the zone.
+    if (zbd_zone_full(&zones[i])) {
+      wp[i] = zbd_zone_start(&zones[i]) + zbd_zone_len(&zones[i]);
+    } else {
+      wp[i] = zbd_zone_wp(&zones[i]);
+    }
   }
   return wp;
 }
