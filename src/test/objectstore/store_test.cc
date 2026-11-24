@@ -13629,6 +13629,106 @@ TEST_P(StoreTestSpecificAUSize, BluefsWriteInNoWalDiskEnvTest) {
   dump_bluefs_stats();
 }
 
+// The zone cleaner resets a zone on the device and then records that in
+// the freelist.  Leave a store as a crash between the two does, and check
+// that it mounts and that the zone can be written again.
+TEST_P(StoreTestSpecificAUSize, ZonedInterruptedCleanTest) {
+  if (string(GetParam()) != "bluestore" || !smr) {
+    GTEST_SKIP() << "not bluestore on a zoned device, skipping";
+  }
+  StartDeferred(4096);
+  BlueStore* bstore = dynamic_cast<BlueStore*>(store.get());
+  ceph_assert(bstore);
+  const uint64_t zone_size = bstore->get_bdev()->get_zone_size();
+  const uint64_t obj_size = 4 * 1024 * 1024;
+  if (zone_size > 512 * 1024 * 1024) {
+    GTEST_SKIP() << "the zones are too large to fill one of them";
+  }
+  // fill one zone and half of the next one
+  const unsigned nobj = (zone_size + zone_size / 2) / obj_size;
+
+  int r;
+  coll_t cid;
+  auto ch = store->create_new_collection(cid);
+  {
+    ObjectStore::Transaction t;
+    t.create_collection(cid, 0);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+  auto oid = [](unsigned i) {
+    return ghobject_t(hobject_t(sobject_t("interrupted " + stringify(i),
+					  CEPH_NOSNAP)));
+  };
+  bufferlist bl;
+  bl.append(std::string(obj_size, 'x'));
+  for (unsigned i = 0; i < nobj; ++i) {
+    ObjectStore::Transaction t;
+    t.write(cid, oid(i), 0, bl.length(), bl);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+  // all of it becomes dead, as after the cleaner moved the data away
+  for (unsigned i = 0; i < nobj; ++i) {
+    ObjectStore::Transaction t;
+    t.remove(cid, oid(i));
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+  ch.reset();
+  ASSERT_EQ(0, store->umount());
+
+  // reset the last zone that holds data: the half filled one
+  {
+    std::string p = data_dir + "/block";
+    BlockDevice* bdev = BlockDevice::create(g_ceph_context, p, nullptr,
+					    nullptr, nullptr, nullptr);
+    ASSERT_EQ(0, bdev->open(p));
+    std::vector<uint64_t> wp = bdev->get_zones();
+    int64_t zone = -1;
+    for (uint64_t i = bdev->get_conventional_region_size() / zone_size;
+	 i < wp.size(); ++i) {
+      if (wp[i] > i * zone_size) {
+	zone = i;
+      }
+    }
+    ASSERT_GT(zone, 0);
+    ASSERT_LT(wp[zone] - zone * zone_size, zone_size);
+    bdev->reset_zone(zone);
+    bdev->close();
+    delete bdev;
+  }
+
+  ASSERT_EQ(0, store->mount());
+  ch = store->open_collection(cid);
+  // enough to reach into the zone that was reset
+  for (unsigned i = 0; i < nobj; ++i) {
+    ObjectStore::Transaction t;
+    t.write(cid, oid(i), 0, bl.length(), bl);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+  for (unsigned i = 0; i < nobj; ++i) {
+    bufferlist in;
+    r = store->read(ch, oid(i), 0, obj_size, in);
+    ASSERT_EQ((int)obj_size, r);
+    ASSERT_TRUE(bl_eq(bl, in)) << "object " << i;
+  }
+  {
+    ObjectStore::Transaction t;
+    for (unsigned i = 0; i < nobj; ++i) {
+      t.remove(cid, oid(i));
+    }
+    t.remove_collection(cid);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+  ch.reset();
+  ASSERT_EQ(0, store->umount());
+  ASSERT_EQ(0, store->fsck(false));
+  ASSERT_EQ(0, store->mount());
+}
+
 TEST_P(StoreTestOmapUpgrade, NoOmapHeader) {
   if (string(GetParam()) != "bluestore")
     return;
