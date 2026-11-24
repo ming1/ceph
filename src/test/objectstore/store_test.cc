@@ -13579,6 +13579,20 @@ TEST_P(StoreTestOmapUpgrade, WithOmapHeader) {
   }
 }
 
+// BlueFS has a "db.slow" directory only when RocksDB is offered a path on
+// the main device.  The fit_to_fast volume selector offers "db" alone, and
+// BlueStore forces that selector on a zoned main device with no conventional
+// zones, as BlueFS cannot use such a device at all.
+static bool bluefs_has_slow_dir(BlueStore* bstore)
+{
+  if (g_conf()->bluestore_volume_selection_policy == "fit_to_fast") {
+    return false;
+  }
+  auto bdev = bstore->get_bdev();
+  return !(bdev && bdev->is_smr() &&
+	   bdev->get_conventional_region_size() == 0);
+}
+
 TEST_P(StoreTestSpecificAUSize, BluefsWriteInSingleDiskEnvTest) {
   if (string(GetParam()) != "bluestore")
     return;
@@ -13589,7 +13603,9 @@ TEST_P(StoreTestSpecificAUSize, BluefsWriteInSingleDiskEnvTest) {
 
   BlueStore* bstore = dynamic_cast<BlueStore*> (store.get());
   ceph_assert(bstore);
-  bstore->inject_bluefs_file("db.slow", "store_test_injection_slow", 1 << 20ul);
+  if (bluefs_has_slow_dir(bstore)) {
+    bstore->inject_bluefs_file("db.slow", "store_test_injection_slow", 1 << 20ul);
+  }
   bstore->inject_bluefs_file("db.wal", "store_test_injection_wal", 1 << 20ul);
   bstore->inject_bluefs_file("db", "store_test_injection_wal", 1 << 20ul);
 
@@ -13610,7 +13626,9 @@ TEST_P(StoreTestSpecificAUSize, BluefsWriteInNoWalDiskEnvTest) {
 
   BlueStore* bstore = dynamic_cast<BlueStore*> (store.get());
   ceph_assert(bstore);
-  bstore->inject_bluefs_file("db.slow", "store_test_injection_slow", 1 << 20ul);
+  if (bluefs_has_slow_dir(bstore)) {
+    bstore->inject_bluefs_file("db.slow", "store_test_injection_slow", 1 << 20ul);
+  }
   bstore->inject_bluefs_file("db.wal", "store_test_injection_wal", 1 << 20ul);
   bstore->inject_bluefs_file("db", "store_test_injection_wal", 1 << 20ul);
 
