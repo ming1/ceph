@@ -84,13 +84,30 @@ int BlueStoreZoned::init_alloc(std::map<uint64_t, uint64_t> *zone_adjustments)
   vector<zone_state_t> zones = f->get_zone_states(bstore->db);
   ceph_assert(wp.size() == zones.size());
 
+  // A read-only open does not get to post_init_alloc().  Whatever it found
+  // is found again here, from the state the device and the DB have now.
+  interrupted_cleans.clear();
+
   // reconcile zone state
   auto num_zones = bstore->bdev->get_size() / zone_size;
   for (unsigned i = first_sequential_zone; i < num_zones; ++i) {
     ceph_assert(wp[i] >= i * zone_size);
     ceph_assert(wp[i] <= (i + 1) * zone_size); // pos might be at start of next zone
     uint64_t p = wp[i] - i * zone_size;
-    if (zones[i].write_pointer > p) {
+    if (zones[i].write_pointer > p &&
+	p == 0 && zones[i].num_dead_bytes == zones[i].write_pointer) {
+      // The cleaner resets the zone on the device first and records it in
+      // the freelist second.  A crash in between leaves this: the zone is
+      // empty on the device, and all the freelist still has for it is dead.
+      // Finish the job, or the next write to the zone would go to the old
+      // write pointer and fail.
+      dout(1) << __func__ << " zone 0x" << std::hex << i
+	      << " was reset on the device but not in the freelist (0x"
+	      << zones[i].write_pointer << " dead bytes), marking it empty"
+	      << std::dec << dendl;
+      interrupted_cleans.push_back(i);
+      zones[i].reset();
+    } else if (zones[i].write_pointer > p) {
       derr << __func__ << " zone 0x" << std::hex << i
 	   << " bluestore write pointer 0x" << zones[i].write_pointer
 	   << " > device write pointer 0x" << p
@@ -140,12 +157,16 @@ int BlueStoreZoned::init_alloc(std::map<uint64_t, uint64_t> *zone_adjustments)
 void BlueStoreZoned::post_init_alloc(const std::map<uint64_t, uint64_t>& zone_adjustments)
 {
   int r = 0;
+  auto f = dynamic_cast<ZonedFreelistManager*>(bstore->fm);
+  ceph_assert(f);
+  for (auto zone : interrupted_cleans) {
+    f->mark_zone_to_clean_free(zone, bstore->db);
+  }
+  interrupted_cleans.clear();
   if (zone_adjustments.empty()) {
     return;
   }
   dout(1) << __func__ << " adjusting freelist based on device write pointers" << dendl;
-  auto f = dynamic_cast<ZonedFreelistManager*>(bstore->fm);
-  ceph_assert(f);
   KeyValueDB::Transaction t = bstore->db->get_transaction();
   for (auto& i : zone_adjustments) {
     // allocate AND release since this gap is now dead space
