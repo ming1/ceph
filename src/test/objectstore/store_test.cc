@@ -1818,8 +1818,8 @@ TEST_P(StoreTestSpecificAUSize, ReproBug41901Test) {
   if(string(GetParam()) != "bluestore")
     return;
   if (smr) {
-    cout << "SKIP (smr)" << std::endl;
-    return;
+    GTEST_SKIP() << "smr, skipping: a small write does not reuse the unused space of a blob "
+		 << "on zoned devices";
   }
 
   SetVal(g_conf(), "bluestore_write_v2", "false");
@@ -2060,8 +2060,8 @@ TEST_P(StoreTestSpecificAUSize, BluestoreStatFSTest) {
   if(string(GetParam()) != "bluestore")
     return;
   if (smr) {
-    cout << "TODO: fix this for smr" << std::endl;
-    return;
+    GTEST_SKIP() << "smr, skipping: the test expects statfs.total to be "
+		 << "bluestore_block_size, not the size of the device";
   }
   SetVal(g_conf(), "bluestore_write_v2", "false");
   SetVal(g_conf(), "bluestore_block_db_path", "");
@@ -2595,8 +2595,8 @@ TEST_P(StoreTestSpecificAUSize, BluestoreFragmentedBlobTest) {
   if(string(GetParam()) != "bluestore")
     return;
   if (smr) {
-    cout << "TODO: fix this for smr" << std::endl;
-    return;
+    GTEST_SKIP() << "smr, skipping: the test expects statfs.total to be "
+		 << "bluestore_block_size, not the size of the device";
   }
   SetVal(g_conf(), "bluestore_write_v2", "false");
   SetVal(g_conf(), "bluestore_block_db_path", "");
@@ -9162,8 +9162,7 @@ TEST_P(StoreTestSpecificAUSize, DeferredOnBigOverwrite1) {
   if (string(GetParam()) != "bluestore")
     return;
   if (smr) {
-    cout << "SKIP: no deferred" << std::endl;
-    return;
+    GTEST_SKIP() << "smr, skipping: no deferred writes on zoned devices";
   }
 
   size_t block_size = 4096;
@@ -9351,8 +9350,7 @@ TEST_P(StoreTestSpecificAUSize, DeferredOnBigOverwrite2) {
   if (string(GetParam()) != "bluestore")
     return;
   if (smr) {
-    cout << "SKIP: no deferred" << std::endl;
-    return;
+    GTEST_SKIP() << "smr, skipping: no deferred writes on zoned devices";
   }
 
   size_t block_size = 4096;
@@ -9502,8 +9500,7 @@ TEST_P(StoreTestSpecificAUSize, DeferredOnBigOverwrite3) {
   if (string(GetParam()) != "bluestore")
     return;
   if (smr) {
-    cout << "SKIP: no deferred" << std::endl;
-    return;
+    GTEST_SKIP() << "smr, skipping: no deferred writes on zoned devices";
   }
 
   size_t block_size = 4096;
@@ -9669,8 +9666,7 @@ TEST_P(StoreTestSpecificAUSize, DeferredOnBigOverwrite4) {
   if (string(GetParam()) != "bluestore")
     return;
   if (smr) {
-    cout << "SKIP: no deferred" << std::endl;
-    return;
+    GTEST_SKIP() << "smr, skipping: no deferred writes on zoned devices";
   }
 
   size_t block_size = 4096;
@@ -9748,8 +9744,7 @@ TEST_P(StoreTestSpecificAUSize, DeferredOnBigOverwrite5) {
   if (string(GetParam()) != "bluestore")
     return;
   if (smr) {
-    cout << "SKIP: no deferred" << std::endl;
-    return;
+    GTEST_SKIP() << "smr, skipping: no deferred writes on zoned devices";
   }
 
   size_t block_size = 4096;
@@ -9827,8 +9822,7 @@ TEST_P(StoreTestSpecificAUSize, DeferredDifferentChunks) {
   if (string(GetParam()) != "bluestore")
     return;
   if (smr) {
-    cout << "SKIP: no deferred" << std::endl;
-    return;
+    GTEST_SKIP() << "smr, skipping: no deferred writes on zoned devices";
   }
 
   size_t alloc_size = 4096;
@@ -10257,8 +10251,7 @@ TEST_P(StoreTestSpecificAUSize, BlobReuseOnSmallOverwrite) {
   if (string(GetParam()) != "bluestore")
     return;
   if (smr) {
-    cout << "SKIP: no overwrite" << std::endl;
-    return;
+    GTEST_SKIP() << "smr, skipping: no overwrite in place on zoned devices";
   }
 
   size_t block_size = 4096;
@@ -10487,8 +10480,7 @@ TEST_P(StoreTestSpecificAUSize, ReproBug56488Test) {
   if (string(GetParam()) != "bluestore")
     return;
   if (smr) {
-    cout << "SKIP: no deferred" << std::endl;
-    return;
+    GTEST_SKIP() << "smr, skipping: no deferred writes on zoned devices";
   }
 
   size_t alloc_size = 65536;
@@ -10862,8 +10854,8 @@ TEST_P(StoreTestSpecificAUSize, BluestoreRepairTest) {
   if (string(GetParam()) != "bluestore")
     return;
   if (smr) {
-    cout << "TODO: repair mismatched write pointer (+ dead bytes mismatch)" << std::endl;
-    return;
+    GTEST_SKIP() << "smr, skipping: TODO: fsck reports leaked space as two errors (write "
+		 << "pointer, dead bytes), adjust the expected counts";
   }
   const size_t offs_base = 65536 / 2;
 
@@ -13100,8 +13092,7 @@ TEST_P(StoreTestSpecificAUSize, SpilloverLegacyTest) {
   if (string(GetParam()) != "bluestore")
     return;
   if (smr) {
-    cout << "SKIP: (FIXME?) adjust me for smr at some point?" << std::endl;
-    return;
+    GTEST_SKIP() << "smr, skipping: FIXME: adjust this test for smr";
   }
 
   SetVal(g_conf(), "bluestore_block_db_create", "true");
@@ -13137,8 +13128,7 @@ TEST_P(StoreTestSpecificAUSize, SpilloverLegacyFixedByFitToFastTest) {
   if (string(GetParam()) != "bluestore")
     return;
   if (smr) {
-    cout << "SKIP: (FIXME?) adjust me for smr at some point?" << std::endl;
-    return;
+    GTEST_SKIP() << "smr, skipping: FIXME: adjust this test for smr";
   }
 
   SetVal(g_conf(), "bluestore_block_db_create", "true");
@@ -13190,8 +13180,7 @@ TEST_P(StoreTestSpecificAUSize, SpilloverTest) {
   if (string(GetParam()) != "bluestore")
     return;
   if (smr) {
-    cout << "SKIP: (FIXME?) adjust me for smr at some point?" << std::endl;
-    return;
+    GTEST_SKIP() << "smr, skipping: FIXME: adjust this test for smr";
   }
 
   SetVal(g_conf(), "bluestore_block_db_create", "true");
@@ -13224,8 +13213,7 @@ TEST_P(StoreTestSpecificAUSize, SpilloverFixedCompletelyTest) {
   if (string(GetParam()) != "bluestore")
     return;
   if (smr) {
-    cout << "SKIP: (FIXME?) adjust me for smr at some point?" << std::endl;
-    return;
+    GTEST_SKIP() << "smr, skipping: FIXME: adjust this test for smr";
   }
 
   SetVal(g_conf(), "bluestore_block_db_create", "true");
@@ -13251,8 +13239,7 @@ TEST_P(StoreTestSpecificAUSize, SpilloverFixedPartialTest) {
   if (string(GetParam()) != "bluestore")
     return;
   if (smr) {
-    cout << "SKIP: (FIXME?) adjust me for smr at some point?" << std::endl;
-    return;
+    GTEST_SKIP() << "smr, skipping: FIXME: adjust this test for smr";
   }
 
   SetVal(g_conf(), "bluestore_block_db_create", "true");
