@@ -1585,10 +1585,6 @@ void StoreTest::doCompressionTest()
 TEST_P(StoreTest, CompressionTest) {
   if (string(GetParam()) != "bluestore")
     return;
-  if (smr) {
-    cout << "TODO: need to adjust statfs check for smr" << std::endl;
-    return;
-  }
 
   SetVal(g_conf(), "bluestore_compression_algorithm", "snappy");
   SetVal(g_conf(), "bluestore_compression_mode", "force");
@@ -4559,10 +4555,6 @@ TEST_P(StoreTest, BlueStoreUnshareBlobSimple) {
 TEST_P(StoreTest, BlueStoreUnshareBlobTest) {
   if (string(GetParam()) != "bluestore")
     return;
-  if (smr) {
-    cout << "SKIP: non-deterministic behavior with smr" << std::endl;
-    return;
-  }
   int r;
   coll_t cid;
   auto ch = store->create_new_collection(cid);
@@ -8341,11 +8333,6 @@ void doMany4KWritesTest(ObjectStore* store,
 TEST_P(StoreTestSpecificAUSize, Many4KWritesTest) {
   if (string(GetParam()) != "bluestore")
     return;
-  if (smr) {
-    cout << "SKIP: no deferred; assertions around res_stat.allocated don't apply"
-	 << std::endl;
-    return;
-  }
 
   StartDeferred(0x10000);
 
@@ -8356,11 +8343,6 @@ TEST_P(StoreTestSpecificAUSize, Many4KWritesTest) {
 TEST_P(StoreTestSpecificAUSize, Many4KWritesNoCSumTest) {
   if (string(GetParam()) != "bluestore")
     return;
-  if (smr) {
-    cout << "SKIP: no deferred; assertions around res_stat.allocated don't apply"
-	 << std::endl;
-    return;
-  }
   StartDeferred(0x10000);
   SetVal(g_conf(), "bluestore_csum_type", "none");
   g_ceph_context->_conf.apply_changes(nullptr);
@@ -8372,11 +8354,6 @@ TEST_P(StoreTestSpecificAUSize, Many4KWritesNoCSumTest) {
 TEST_P(StoreTestSpecificAUSize, TooManyBlobsTest) {
   if (string(GetParam()) != "bluestore")
     return;
-  if (smr) {
-    cout << "SKIP: no deferred; assertions around res_stat.allocated don't apply"
-	 << std::endl;
-    return;
-  }
   StartDeferred(0x10000);
   const unsigned max_object = 4*1024*1024;
   doMany4KWritesTest(store.get(), 1, 1000, max_object, 4*1024, 0);
@@ -10103,10 +10080,6 @@ TEST_P(StoreTestSpecificAUSize, BlobReuseOnOverwriteReverse) {
 
   if (string(GetParam()) != "bluestore")
     return;
-  if (smr) {
-    cout << "SKIP: no overwrite" << std::endl;
-    return;
-  }
 
   size_t block_size = 4096;
   StartDeferred(block_size);
@@ -10690,11 +10663,10 @@ TEST_P(StoreTestSpecificAUSize, garbageCollection) {
   int write_offset = buf_len;
   if (string(GetParam()) != "bluestore")
     return;
-  if (smr) {
-    cout << "SKIP: assertions about allocations need to be adjusted" << std::endl;
-    return;
-  }
 
+  // On a zoned device a small write takes the rest of its allocation unit
+  // along to a new blob, so less is left for garbage collection: the
+  // counter stops at 0x30000 where other devices go on.
 #define WRITE_AT(offset, _length) {\
       ObjectStore::Transaction t;\
       if ((uint64_t)_length != bl.length()) { \
@@ -10808,7 +10780,7 @@ TEST_P(StoreTestSpecificAUSize, garbageCollection) {
       ASSERT_EQ(r, 0);
       ASSERT_EQ(statfs.data_compressed_allocated, 0x10000);
       const PerfCounters* counters = store->get_perf_counters();
-      ASSERT_EQ(counters->get(l_bluestore_gc_merged), 0x3ffffu);
+      ASSERT_EQ(counters->get(l_bluestore_gc_merged), smr ? 0x30000u : 0x3ffffu);
     }
     {
       struct store_statfs_t statfs;
@@ -10817,7 +10789,7 @@ TEST_P(StoreTestSpecificAUSize, garbageCollection) {
       ASSERT_EQ(r, 0);
       ASSERT_EQ(statfs.data_compressed_allocated, 0x10000);
       const PerfCounters* counters = store->get_perf_counters();
-      ASSERT_EQ(counters->get(l_bluestore_gc_merged), 0x40001u);
+      ASSERT_EQ(counters->get(l_bluestore_gc_merged), smr ? 0x30000u : 0x40001u);
     }
     SetVal(g_conf(), "bluestore_gc_enable_total_threshold", "1"); //forbid GC when saving = 0
     {
@@ -10828,7 +10800,7 @@ TEST_P(StoreTestSpecificAUSize, garbageCollection) {
       ASSERT_EQ(r, 0);
       ASSERT_EQ(statfs.data_compressed_allocated, 0x10000);
       const PerfCounters* counters = store->get_perf_counters();
-      ASSERT_EQ(counters->get(l_bluestore_gc_merged), 0x40001u);
+      ASSERT_EQ(counters->get(l_bluestore_gc_merged), smr ? 0x30000u : 0x40001u);
     }
     {
       struct store_statfs_t statfs;
@@ -10837,7 +10809,7 @@ TEST_P(StoreTestSpecificAUSize, garbageCollection) {
       ASSERT_EQ(r, 0);
       ASSERT_EQ(statfs.data_compressed_allocated, 0x0);
       const PerfCounters* counters = store->get_perf_counters();
-      ASSERT_EQ(counters->get(l_bluestore_gc_merged), 0x40007u);
+      ASSERT_EQ(counters->get(l_bluestore_gc_merged), smr ? 0x30000u : 0x40007u);
     }
     {
       ObjectStore::Transaction t;
@@ -11101,8 +11073,12 @@ TEST_P(StoreTestSpecificAUSize, BluestoreBrokenZombieRepairTest) {
   if (string(GetParam()) != "bluestore")
     return;
   if (smr) {
-    cout << "SKIP: smr repair is different" << std::endl;
-    return;
+    // Each of the 1024 small writes of a transaction below is an aio of
+    // its own on a zoned device, and the device takes the writes of one
+    // zone one at a time.  With the default queue depth of 1024 the batch
+    // is submitted in many parts and can use up the retries of
+    // aio_submit().  Give the queue room for the whole batch.
+    SetVal(g_conf(), "bdev_aio_max_queue_depth", "4096");
   }
   SetVal(g_conf(), "bluestore_fsck_on_mount", "false");
   SetVal(g_conf(), "bluestore_fsck_on_umount", "false");
@@ -11177,10 +11153,6 @@ TEST_P(StoreTestSpecificAUSize, BluestoreBrokenZombieRepairTest) {
 TEST_P(StoreTestSpecificAUSize, BluestoreRepairSharedBlobTest) {
   if (string(GetParam()) != "bluestore")
     return;
-  if (smr) {
-    cout << "TODO: repair mismatched write pointer (+ dead bytes mismatch)" << std::endl;
-    return;
-  }
 
   SetVal(g_conf(), "bluestore_fsck_on_mount", "false");
   SetVal(g_conf(), "bluestore_fsck_on_umount", "false");
@@ -11371,10 +11343,6 @@ TEST_P(StoreTestSpecificAUSize, BluestoreRepairSharedBlobMultiPextent) {
 TEST_P(StoreTestSpecificAUSize, BluestoreBrokenNoSharedBlobRepairTest) {
   if (string(GetParam()) != "bluestore")
     return;
-  if (smr) {
-    cout << "SKIP: smr repair is different" << std::endl;
-    return;
-  }
 
   SetVal(g_conf(), "bluestore_fsck_on_mount", "false");
   SetVal(g_conf(), "bluestore_fsck_on_umount", "false");
@@ -13009,10 +12977,6 @@ TEST_P(StoreTestSpecificAUSize, ReproNoBlobMultiTest) {
 
   if(string(GetParam()) != "bluestore")
     return;
-  if (smr) {
-    cout << "SKIP (FIXME): bluestore gc does not seem to do the trick here" << std::endl;
-    return;
-  }
 
   SetVal(g_conf(), "bluestore_write_v2", "false");
   SetVal(g_conf(), "bluestore_block_db_create", "true");
@@ -13094,7 +13058,11 @@ TEST_P(StoreTestSpecificAUSize, ReproNoBlobMultiTest) {
     int r = store->statfs(&statfs);
     ASSERT_EQ(r, 0);
     const PerfCounters* logger = store->get_perf_counters();
-    ASSERT_GE(logger->get(l_bluestore_gc_merged), 900*1024*1024);
+    if (!smr) {
+      // A zoned device has nothing to collect: a small write takes the
+      // rest of its allocation unit along into its new blob.
+      ASSERT_GE(logger->get(l_bluestore_gc_merged), 900*1024*1024);
+    }
     ASSERT_LE(statfs.allocated, 9LL*1024*1024*1024);
   }
 }
@@ -13422,9 +13390,6 @@ TEST_P(StoreTest, BluestoreDefaultMinAllocSizeNoAlertTest) {
 TEST_P(StoreTestSpecificAUSize, Ticket45195Repro) {
   if (string(GetParam()) != "bluestore")
     return;
-  if (smr) {
-    return;
-  }
 
   SetVal(g_conf(), "bluestore_default_buffered_write", "true");
   SetVal(g_conf(), "bluestore_max_blob_size", "65536");
