@@ -9114,10 +9114,10 @@ BlueStore::CollectionRef BlueStore::_get_collection_by_oid(const ghobject_t& oid
 
   // FIXME: we must replace this with something more efficient
 
+  // contains() is false for anything but a PG collection and the meta
+  // collection, so every collection can be asked.
   for (auto& i : coll_map) {
-    spg_t spgid;
-    if (i.first.is_pg(&spgid) &&
-	i.second->contains(oid)) {
+    if (i.second->contains(oid)) {
       return i.second;
     }
   }
