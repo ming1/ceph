@@ -92,6 +92,10 @@ class BlueStoreZoned {
     );
   void clean_some(ghobject_t oid, uint32_t zone);
 
+  /// zones that init_alloc() found reset on the device but not in the
+  /// freelist; post_init_alloc() marks them empty in the freelist
+  std::vector<uint64_t> interrupted_cleans;
+
 public:
   explicit BlueStoreZoned(BlueStore *bstore)
     : bstore(bstore), zoned_cleaner_thread(this) {}
