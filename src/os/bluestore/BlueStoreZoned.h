@@ -93,6 +93,10 @@ class BlueStoreZoned {
     );
   void clean_some(ghobject_t oid, uint32_t zone);
 
+  /// zones that init_alloc() found reset on the device but not in the
+  /// freelist; post_init_alloc() marks them empty in the freelist
+  std::vector<uint64_t> interrupted_cleans;
+
   /// fsck repair: f corrects the state of one zone in the freelist
   void fsck_fix_zone_state(
     BlueStoreRepairer *repairer,
