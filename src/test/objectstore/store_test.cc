@@ -12892,6 +12892,49 @@ TEST_P(StoreTest, FixSMRWritePointer) {
   bdev->close();
   delete bdev;
 
+  // The mount finds the device write pointer ahead of the one in the
+  // freelist, moves the freelist one up and counts the gap as dead bytes.
+  r = store->mount();
+  ASSERT_EQ(0, r);
+
+  // That fix is in the DB now: fsck must agree with it, and the next
+  // mounts must not apply it a second time.
+  for (int i = 0; i < 2; ++i) {
+    r = store->umount();
+    ASSERT_EQ(0, r);
+    ASSERT_EQ(0, store->fsck(false));
+    r = store->mount();
+    ASSERT_EQ(0, r);
+  }
+
+  // The zone is still usable: the next write lands behind the gap.
+  coll_t cid;
+  ghobject_t hoid(hobject_t(sobject_t("after the gap", CEPH_NOSNAP)));
+  auto ch = store->create_new_collection(cid);
+  {
+    ObjectStore::Transaction t;
+    t.create_collection(cid, 0);
+    t.write(cid, hoid, 0, bl.length(), bl);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(0, r);
+  }
+  {
+    bufferlist in;
+    r = store->read(ch, hoid, 0, bl.length(), in);
+    ASSERT_EQ((int)bl.length(), r);
+    ASSERT_TRUE(bl_eq(bl, in));
+  }
+  {
+    ObjectStore::Transaction t;
+    t.remove(cid, hoid);
+    t.remove_collection(cid);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(0, r);
+  }
+  ch.reset();
+  r = store->umount();
+  ASSERT_EQ(0, r);
+  ASSERT_EQ(0, store->fsck(false));
   r = store->mount();
   ASSERT_EQ(0, r);
 }
