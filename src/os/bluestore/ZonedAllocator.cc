@@ -146,6 +146,14 @@ uint64_t ZonedAllocator::get_free()
 void ZonedAllocator::dump()
 {
   std::lock_guard l(lock);
+  ldout(cct, 0) << __func__ << " zones:" << dendl;
+  for (uint64_t zone = first_seq_zone_num; zone < num_zones; ++zone) {
+    ldout(cct, 0) << std::hex
+		  << "zone 0x" << zone
+		  << " write pointer 0x" << get_write_pointer(zone)
+		  << " dead bytes 0x" << zone_states[zone].get_num_dead_bytes()
+		  << std::dec << dendl;
+  }
 }
 
 void ZonedAllocator::foreach(
