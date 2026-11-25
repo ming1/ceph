@@ -255,3 +255,75 @@ class TestList(object):
             assert info['device_wal'] == '/dev/vdd'
             assert info['ceph_fsid'] == 'cluster-fsid'
             assert info['osd_id'] == 0
+
+    # A zoned main device without conventional zones cannot rewrite its
+    # label, so BlueStore keeps whoami and ceph_fsid in the label of block.db.
+    zoned_labels = {
+        '/dev/nvme0n2': {
+            'osd_uuid': 'zoned-uuid',
+            'description': 'main',
+        },
+        '/dev/nvme0n1': {
+            'osd_uuid': 'zoned-uuid',
+            'description': 'bluefs db',
+            'ceph_fsid': 'cluster-fsid',
+            'whoami': '7',
+        },
+    }
+
+    @patch('ceph_volume.devices.raw.list.process.call')
+    def test_osd_id_from_db_label(self, patched_call):
+        patched_call.return_value = (json.dumps(self.zoned_labels), '', 0)
+
+        for order in (
+            ['/dev/nvme0n2', '/dev/nvme0n1'],
+            ['/dev/nvme0n1', '/dev/nvme0n2'],
+        ):
+            result = list_command._get_bluestore_info(order)
+            assert result['zoned-uuid'] == {
+                'osd_uuid': 'zoned-uuid',
+                'type': 'bluestore',
+                'device': '/dev/nvme0n2',
+                'device_db': '/dev/nvme0n1',
+                'osd_id': 7,
+                'ceph_fsid': 'cluster-fsid',
+                'meta_in_db': True,
+            }
+
+    @patch('ceph_volume.devices.raw.list.process.call')
+    def test_main_label_without_whoami_alone(self, patched_call):
+        labels = {'/dev/nvme0n2': self.zoned_labels['/dev/nvme0n2']}
+        patched_call.return_value = (json.dumps(labels), '', 0)
+
+        # not a usable OSD for the report
+        assert list_command._get_bluestore_info(['/dev/nvme0n2']) == {}
+        # kept for a caller that looks for the block.db device itself
+        result = list_command._get_bluestore_info(['/dev/nvme0n2'],
+                                                  keep_incomplete=True)
+        assert result == {'zoned-uuid': {'osd_uuid': 'zoned-uuid',
+                                         'type': 'bluestore',
+                                         'device': '/dev/nvme0n2'}}
+
+    @patch('ceph_volume.devices.raw.list.process.call')
+    def test_main_label_wins_over_db_label(self, patched_call):
+        labels = {
+            '/dev/vdb': {
+                'osd_uuid': 'same-uuid',
+                'description': 'main',
+                'ceph_fsid': 'cluster-fsid',
+                'whoami': '0',
+            },
+            '/dev/vdc': {
+                'osd_uuid': 'same-uuid',
+                'description': 'bluefs db',
+                'ceph_fsid': 'other-fsid',
+                'whoami': '5',
+            },
+        }
+        patched_call.return_value = (json.dumps(labels), '', 0)
+
+        for order in (['/dev/vdb', '/dev/vdc'], ['/dev/vdc', '/dev/vdb']):
+            info = list_command._get_bluestore_info(order)['same-uuid']
+            assert info['osd_id'] == 0
+            assert info['ceph_fsid'] == 'cluster-fsid'
+            assert 'meta_in_db' not in info
