@@ -462,6 +462,45 @@ int BlueStoreZoned::read_meta(const std::string& key, std::string *value)
   return 0;
 }
 
+int BlueStoreZoned::copy_meta_to_new_db(BlockDevice *new_dev,
+					const std::string& new_path)
+{
+  std::string p = bstore->path + "/block.db";
+  BlockDevice *old_dev =
+    bstore->bluefs ? bstore->bluefs->get_block_device(BlueFS::BDEV_DB) : nullptr;
+  if (!old_dev) {
+    derr << __func__ << " no block.db to take the meta keys from" << dendl;
+    return -ENOENT;
+  }
+  bluestore_bdev_label_t old_label, new_label;
+  int r = BlueStore::_read_bdev_label(bstore->cct, old_dev, p, &old_label,
+				      BDEV_FIRST_LABEL_POSITION);
+  if (r != 0 || old_label.osd_uuid != bstore->fsid) {
+    derr << __func__ << " cannot read the label of " << p << ": "
+	 << cpp_strerror(r) << dendl;
+    return r < 0 ? r : -EIO;
+  }
+  r = BlueStore::_read_bdev_label(bstore->cct, new_dev, new_path, &new_label,
+				  BDEV_FIRST_LABEL_POSITION);
+  if (r != 0 || new_label.osd_uuid != bstore->fsid) {
+    derr << __func__ << " cannot read the label of " << new_path << ": "
+	 << cpp_strerror(r) << dendl;
+    return r < 0 ? r : -EIO;
+  }
+  new_label.meta = old_label.meta;
+  r = BlueStore::_write_bdev_label(bstore->cct, new_dev, new_path, new_label,
+				   {BDEV_FIRST_LABEL_POSITION});
+  if (r < 0) {
+    derr << __func__ << " failed to write the label of " << new_path << ": "
+	 << cpp_strerror(r) << dendl;
+    return r;
+  }
+  dout(1) << __func__ << " copied " << new_label.meta.size()
+	  << " meta keys from the label of " << p << " to " << new_path
+	  << dendl;
+  return 0;
+}
+
 void BlueStoreZoned::mkfs_super(KeyValueDB::Transaction& t)
 {
   {

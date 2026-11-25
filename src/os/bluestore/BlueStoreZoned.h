@@ -38,6 +38,7 @@
 #include "bluestore_types.h"
 #include "BlueStore_fwd.h"
 
+class BlockDevice;
 class BlueStore;
 class BlueStoreRepairer;
 class ZonedAllocator;
@@ -136,6 +137,10 @@ public:
   /// @return 0 if the label of block.db is ours and has the key, a negative
   /// error if not
   int read_meta(const std::string& key, std::string *value);
+  /// bluefs-bdev-migrate to a new block.db, on a device with no
+  /// conventional zones: give the label of the new device the meta keys
+  /// that the label of the current block.db has.
+  int copy_meta_to_new_db(BlockDevice *new_dev, const std::string& new_path);
   /// fsck: the state of the zone ref check.
   ///
   /// The check compares two sets of (zone, object) pairs: the zone ref
@@ -289,6 +294,12 @@ inline int BlueStoreZoned::write_meta(const std::string& key,
 
 inline int BlueStoreZoned::read_meta(const std::string& key,
 				     std::string *value)
+{
+  BLUESTORE_ZONED_STUB;
+}
+
+inline int BlueStoreZoned::copy_meta_to_new_db(BlockDevice *new_dev,
+					       const std::string& new_path)
 {
   BLUESTORE_ZONED_STUB;
 }

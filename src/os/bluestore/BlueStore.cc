@@ -5564,6 +5564,15 @@ int BlueStore::migrate_to_new_bluefs_device(const set<int>& devs_source,
         "bluefs db",
 	true);
       ceph_assert(r == 0);
+      if (bdev->is_smr() && bdev->get_conventional_region_size() == 0) {
+	// Pure ZNS: the meta key/values are in the label of block.db (see
+	// write_meta()), so the label of the new block.db must get them.
+	r = zoned.copy_meta_to_new_db(
+	  bluefs->get_block_device(BlueFS::BDEV_NEWDB), dev_path);
+	if (r < 0) {
+	  return r;
+	}
+      }
     }
   }
 
