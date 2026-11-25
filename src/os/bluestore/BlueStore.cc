@@ -14503,7 +14503,12 @@ int BlueStore::_do_gc(
   WriteContext wctx_gc;
   wctx_gc.fork(wctx); // make a clone for garbage collection
 
-  auto & extents_to_collect = wctx.extents_to_gc;
+  interval_set<uint64_t> zoned_units;
+  if (bdev->is_smr()) {
+    zoned.gc_whole_units(o, wctx.extents_to_gc, &zoned_units);
+  }
+  auto & extents_to_collect =
+    bdev->is_smr() ? zoned_units : wctx.extents_to_gc;
   for (auto it = extents_to_collect.begin();
        it != extents_to_collect.end();
        ++it) {

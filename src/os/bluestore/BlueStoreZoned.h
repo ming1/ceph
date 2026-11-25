@@ -144,6 +144,10 @@ public:
   void txc_finalize_kv(TransContext *txc);
   void cleaner_start();
   void cleaner_stop();
+  void gc_whole_units(
+    OnodeRef& o,
+    const interval_set<uint64_t>& extents,
+    interval_set<uint64_t> *units);
   void do_write_small(
     CollectionRef& c,
     OnodeRef& o,
@@ -295,6 +299,14 @@ inline void BlueStoreZoned::clean_zone(
 }
 
 inline void BlueStoreZoned::clean_some(ghobject_t oid, uint32_t zone)
+{
+  BLUESTORE_ZONED_STUB;
+}
+
+inline void BlueStoreZoned::gc_whole_units(
+  OnodeRef& o,
+  const interval_set<uint64_t>& extents,
+  interval_set<uint64_t> *units)
 {
   BLUESTORE_ZONED_STUB;
 }
