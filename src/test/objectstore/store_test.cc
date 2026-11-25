@@ -14131,6 +14131,105 @@ TEST_P(StoreTestSpecificAUSize, ZonedCloneOverwriteV2CompressedTest) {
   doZonedCloneOverwriteTest(store.get(), true);
 }
 
+// Zones whose capacity is not a multiple of the allocation unit: the tail of
+// a zone cannot be allocated, so BlueStore has to finish the zone itself.
+TEST_P(StoreTestSpecificAUSize, ZonedUnalignedCapacityTest) {
+  if (string(GetParam()) != "bluestore" || !smr) {
+    GTEST_SKIP() << "not bluestore on a zoned device, skipping";
+  }
+  uint64_t zone_capacity = 0;
+  {
+    std::string p = g_conf()->bluestore_block_path;
+    BlockDevice* bdev = BlockDevice::create(g_ceph_context, p, nullptr, nullptr,
+					    nullptr, nullptr);
+    ASSERT_EQ(0, bdev->open(p));
+    zone_capacity = bdev->get_zone_capacity();
+    bdev->close();
+    delete bdev;
+  }
+  uint64_t au = 0;
+  for (uint64_t a = 65536; a <= 4 * 1024 * 1024; a *= 2) {
+    if (zone_capacity % a) {
+      au = a;
+      break;
+    }
+  }
+  if (!au) {
+    GTEST_SKIP() << "the zone capacity is a multiple of every allocation unit"
+		 << " up to 4M";
+  }
+  const uint64_t obj_size = 4 * 1024 * 1024;
+  SetVal(g_conf(), "bluestore_max_blob_size", stringify(obj_size).c_str());
+  // the cleaner thread finishes the zones, let it look often
+  SetVal(g_conf(), "bluestore_cleaner_sleep_interval", "0.01");
+  g_conf().apply_changes(nullptr);
+  StartDeferred(au);
+
+  int r;
+  coll_t cid(spg_t(pg_t(0, 555), shard_id_t::NO_SHARD));
+  auto ch = store->create_new_collection(cid);
+  {
+    ObjectStore::Transaction t;
+    t.create_collection(cid, 0);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+  auto oid = [&](unsigned i) {
+    return ghobject_t(hobject_t(sobject_t("unaligned " + stringify(i),
+					  CEPH_NOSNAP),
+				"", i * 2654435761u, 555, ""));
+  };
+  auto content = [&](unsigned i) {
+    bufferlist bl;
+    bufferptr bp(obj_size);
+    std::mt19937_64 rng(i + 1);
+    for (uint64_t off = 0; off < obj_size; off += sizeof(uint64_t)) {
+      uint64_t v = rng();
+      memcpy(bp.c_str() + off, &v, sizeof(v));
+    }
+    bl.append(bp);
+    return bl;
+  };
+  // fill three zones and start a fourth
+  const unsigned nobj = 3 * zone_capacity / obj_size + 2;
+  for (unsigned i = 0; i < nobj; ++i) {
+    bufferlist bl = content(i);
+    ObjectStore::Transaction t;
+    t.write(cid, oid(i), 0, bl.length(), bl);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+  auto verify = [&]() {
+    for (unsigned i = 0; i < nobj; ++i) {
+      bufferlist expected = content(i);
+      bufferlist in;
+      r = store->read(ch, oid(i), 0, obj_size, in);
+      ASSERT_EQ((int)obj_size, r);
+      ASSERT_TRUE(bl_eq(expected, in)) << "object " << i;
+    }
+  };
+  verify();
+  // The full zones are finished on the device now.  Neither the mount nor
+  // fsck may take the tail that could not be allocated for a difference.
+  for (int i = 0; i < 2; ++i) {
+    ch.reset();
+    ASSERT_EQ(0, store->umount());
+    ASSERT_EQ(0, store->fsck(false));
+    ASSERT_EQ(0, store->mount());
+    ch = store->open_collection(cid);
+    verify();
+  }
+  {
+    ObjectStore::Transaction t;
+    for (unsigned i = 0; i < nobj; ++i) {
+      t.remove(cid, oid(i));
+    }
+    t.remove_collection(cid);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+}
+
 // A crash in the middle of a write can leave the device write pointer of
 // a zone inside an allocation unit.  The store must come up, fsck must be
 // clean, and the zone must fill up to where the mount and fsck expect its
