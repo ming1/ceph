@@ -13729,6 +13729,161 @@ TEST_P(StoreTestSpecificAUSize, ZonedInterruptedCleanTest) {
   ASSERT_EQ(0, store->mount());
 }
 
+// Make the zone cleaner move live data out of a zone and reset it, then
+// check that the data survived.  The objects go to the meta collection or
+// to a PG collection.
+void doZonedCleanerTest(ObjectStore *store, bool meta)
+{
+  BlueStore* bstore = dynamic_cast<BlueStore*>(store);
+  ceph_assert(bstore);
+  const uint64_t zone_size = bstore->get_bdev()->get_zone_size();
+  const uint64_t obj_size = 4 * 1024 * 1024;
+  if (zone_size > 512 * 1024 * 1024) {
+    GTEST_SKIP() << "the zones are too large to fill three of them";
+  }
+  // Three zones of data: on a device with no conventional zones the first
+  // zone holds the label and is never cleaned.
+  const unsigned nobj = 3 * zone_size / obj_size;
+
+  int r;
+  const int64_t pool = meta ? -1 : 555;
+  coll_t cid;
+  if (!meta) {
+    cid = coll_t(spg_t(pg_t(0, pool), shard_id_t::NO_SHARD));
+  }
+  auto ch = store->create_new_collection(cid);
+  {
+    ObjectStore::Transaction t;
+    t.create_collection(cid, 0);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+  auto oid = [&](unsigned i) {
+    return ghobject_t(hobject_t(sobject_t("cleaner " + stringify(i),
+					  CEPH_NOSNAP),
+				"", i * 2654435761u, pool, ""));
+  };
+  auto content = [&](unsigned i) {
+    bufferlist bl;
+    bufferptr bp(obj_size);
+    // not compressible, and different in every object
+    std::mt19937_64 rng(i + 1);
+    for (uint64_t off = 0; off < obj_size; off += sizeof(uint64_t)) {
+      uint64_t v = rng();
+      memcpy(bp.c_str() + off, &v, sizeof(v));
+    }
+    bl.append(bp);
+    return bl;
+  };
+  for (unsigned i = 0; i < nobj; ++i) {
+    bufferlist bl = content(i);
+    ObjectStore::Transaction t;
+    t.write(cid, oid(i), 0, bl.length(), bl);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+
+  struct store_statfs_t before;
+  ASSERT_EQ(0, store->statfs(&before));
+
+  // Keep one object in eight: every zone is left mostly dead with some
+  // live data that the cleaner has to move before it can reset the zone.
+  auto kept = [](unsigned i) { return i % 8 == 0; };
+  for (unsigned i = 0; i < nobj; ++i) {
+    if (kept(i)) {
+      continue;
+    }
+    ObjectStore::Transaction t;
+    t.remove(cid, oid(i));
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+
+  // Removing data frees nothing on a zoned device.  Free space only grows
+  // when a zone is reset, so wait for that.
+  bool cleaned = false;
+  for (int i = 0; i < 600 && !cleaned; ++i) {
+    struct store_statfs_t now;
+    ASSERT_EQ(0, store->statfs(&now));
+    cleaned = now.available >= before.available + zone_size / 2;
+    if (!cleaned) {
+      usleep(100000);
+    }
+  }
+  ASSERT_TRUE(cleaned) << "no zone was cleaned within 60 seconds";
+
+  auto verify = [&]() {
+    for (unsigned i = 0; i < nobj; ++i) {
+      if (!kept(i)) {
+	ASSERT_FALSE(store->exists(ch, oid(i)));
+	continue;
+      }
+      bufferlist expected = content(i);
+      bufferlist in;
+      r = store->read(ch, oid(i), 0, obj_size, in);
+      ASSERT_EQ((int)obj_size, r);
+      ASSERT_TRUE(bl_eq(expected, in)) << "object " << i;
+    }
+  };
+  verify();
+
+  ch.reset();
+  ASSERT_EQ(0, store->umount());
+  ASSERT_EQ(0, store->fsck(true));
+  ASSERT_EQ(0, store->mount());
+  ch = store->open_collection(cid);
+  verify();
+
+  {
+    ObjectStore::Transaction t;
+    for (unsigned i = 0; i < nobj; ++i) {
+      if (kept(i)) {
+	t.remove(cid, oid(i));
+      }
+    }
+    t.remove_collection(cid);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+}
+
+TEST_P(StoreTestSpecificAUSize, ZonedCleanerTest) {
+  if (string(GetParam()) != "bluestore" || !smr) {
+    GTEST_SKIP() << "not bluestore on a zoned device, skipping";
+  }
+  // let the cleaner run although the device is far from full
+  SetVal(g_conf(), "bluestore_zoned_cleaner_min_free_ratio", "1");
+  SetVal(g_conf(), "bluestore_cleaner_sleep_interval", "0.1");
+  SetVal(g_conf(), "bluestore_write_v2", "false");
+  g_conf().apply_changes(nullptr);
+  StartDeferred(4096);
+  doZonedCleanerTest(store.get(), false);
+}
+
+TEST_P(StoreTestSpecificAUSize, ZonedCleanerMetaTest) {
+  if (string(GetParam()) != "bluestore" || !smr) {
+    GTEST_SKIP() << "not bluestore on a zoned device, skipping";
+  }
+  SetVal(g_conf(), "bluestore_zoned_cleaner_min_free_ratio", "1");
+  SetVal(g_conf(), "bluestore_cleaner_sleep_interval", "0.1");
+  SetVal(g_conf(), "bluestore_write_v2", "false");
+  g_conf().apply_changes(nullptr);
+  StartDeferred(4096);
+  doZonedCleanerTest(store.get(), true);
+}
+
+TEST_P(StoreTestSpecificAUSize, ZonedCleanerV2Test) {
+  if (string(GetParam()) != "bluestore" || !smr) {
+    GTEST_SKIP() << "not bluestore on a zoned device, skipping";
+  }
+  SetVal(g_conf(), "bluestore_zoned_cleaner_min_free_ratio", "1");
+  SetVal(g_conf(), "bluestore_cleaner_sleep_interval", "0.1");
+  SetVal(g_conf(), "bluestore_write_v2", "true");
+  g_conf().apply_changes(nullptr);
+  StartDeferred(4096);
+  doZonedCleanerTest(store.get(), false);
+}
+
 TEST_P(StoreTestOmapUpgrade, NoOmapHeader) {
   if (string(GetParam()) != "bluestore")
     return;
