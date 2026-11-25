@@ -22,6 +22,7 @@
 
 #include "BlueStore.h"
 #include "BlueStoreZoned.h"
+#include "BlueFS.h"
 #include "BlueStore_objects.h"
 #include "BlueStore_inlines.h"
 #include "BlueStore_components.h"
@@ -334,6 +335,82 @@ int BlueStoreZoned::mkfs_init_main_device(uint64_t reserved)
     }
   }
   bdev->flush();
+  return 0;
+}
+
+int BlueStoreZoned::write_meta(const std::string& key,
+			       const std::string& value)
+{
+  if (!bstore->bluefs) {
+    // mkfs writes its first keys ("type", "extblkdev") before it opens
+    // block.db and makes its label.  They stay in the OSD directory only.
+    // Every other key is written while BlueFS has the device open.
+    dout(10) << __func__ << " " << key << ": block.db is not open, the key"
+	     << " goes to the directory only" << dendl;
+    return 0;
+  }
+  std::string p = bstore->path + "/block.db";
+  BlockDevice *dev = bstore->bluefs->get_block_device(BlueFS::BDEV_DB);
+  if (!dev) {
+    derr << __func__ << " " << key << ": no block.db device" << dendl;
+    return -EIO;
+  }
+  // BlueFS made or checked this label when it opened the device, so a
+  // failure here is an error, and the key must not look as if it was stored
+  bluestore_bdev_label_t label;
+  int r = BlueStore::_read_bdev_label(bstore->cct, dev, p, &label,
+				      BDEV_FIRST_LABEL_POSITION);
+  if (r != 0) {
+    derr << __func__ << " " << key << ": cannot read the label of " << p
+	 << ": " << (r < 0 ? cpp_strerror(r) : "device too small") << dendl;
+    return r < 0 ? r : -EIO;
+  }
+  if (label.osd_uuid != bstore->fsid &&
+      !bstore->cct->_conf->bluestore_debug_permit_any_bdev_label) {
+    derr << __func__ << " " << key << ": the label of " << p << " has fsid "
+	 << label.osd_uuid << ", ours is " << bstore->fsid << dendl;
+    return -EIO;
+  }
+  label.meta[key] = value;
+  r = BlueStore::_write_bdev_label(bstore->cct, dev, p, label,
+				   {BDEV_FIRST_LABEL_POSITION});
+  if (r < 0) {
+    derr << __func__ << " failed to write " << key << " to the label of "
+	 << p << ": " << cpp_strerror(r) << dendl;
+  }
+  return r;
+}
+
+int BlueStoreZoned::read_meta(const std::string& key, std::string *value)
+{
+  std::string p = bstore->path + "/block.db";
+  bluestore_bdev_label_t label;
+  BlockDevice *dev =
+    bstore->bluefs ? bstore->bluefs->get_block_device(BlueFS::BDEV_DB) : nullptr;
+  int r;
+  if (dev) {
+    r = BlueStore::_read_bdev_label(bstore->cct, dev, p, &label,
+				    BDEV_FIRST_LABEL_POSITION);
+  } else {
+    r = BlueStore::read_bdev_label_at_pos(bstore->cct, p,
+					  BDEV_FIRST_LABEL_POSITION, &label);
+  }
+  if (r != 0) {
+    return r < 0 ? r : -ENOENT;
+  }
+  // The fsid is not known yet when a closed store is asked for a key; any
+  // label is taken then, as for the label of the main device.
+  if (!bstore->fsid.is_zero() && label.osd_uuid != bstore->fsid &&
+      !bstore->cct->_conf->bluestore_debug_permit_any_bdev_label) {
+    dout(1) << __func__ << " " << key << ": the label of " << p << " has fsid "
+	    << label.osd_uuid << ", ours is " << bstore->fsid << dendl;
+    return -ENOENT;
+  }
+  auto i = label.meta.find(key);
+  if (i == label.meta.end()) {
+    return -ENOENT;
+  }
+  *value = i->second;
   return 0;
 }
 
