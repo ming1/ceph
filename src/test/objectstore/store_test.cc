@@ -14,6 +14,7 @@
  */
 
 #include <fcntl.h>
+#include <filesystem>
 #include <glob.h>
 #include <kv/KeyValueDB.h>
 #include <stdio.h>
@@ -14133,6 +14134,64 @@ TEST_P(StoreTestSpecificAUSize, ZonedCloneOverwriteV2CompressedTest) {
 
 // Zones whose capacity is not a multiple of the allocation unit: the tail of
 // a zone cannot be allocated, so BlueStore has to finish the zone itself.
+// A device without conventional zones cannot rewrite its label, so the meta
+// keys of the store are in the label of block.db.  The store must open with
+// an OSD directory that has lost them, which is what ceph-volume leaves
+// behind when it builds the directory again on a tmpfs.
+TEST_P(StoreTestSpecificAUSize, ZonedMetaInDbLabelTest) {
+  if (string(GetParam()) != "bluestore" || !smr) {
+    GTEST_SKIP() << "not bluestore on a zoned device, skipping";
+  }
+  {
+    std::string p = g_conf()->bluestore_block_path;
+    BlockDevice* bdev = BlockDevice::create(g_ceph_context, p, nullptr, nullptr,
+					    nullptr, nullptr);
+    ASSERT_EQ(0, bdev->open(p));
+    bool conventional = bdev->get_conventional_region_size() > 0;
+    bdev->close();
+    delete bdev;
+    if (conventional) {
+      GTEST_SKIP() << "the device has conventional zones, its label holds"
+		   << " the meta keys";
+    }
+  }
+  StartDeferred(65536);
+  ASSERT_EQ(0, store->write_meta("zoned_test_key", "v1"));
+  store->umount();
+
+  // keep what "ceph-bluestore-tool prime-osd-dir" writes, and the links
+  std::vector<std::filesystem::path> lost;
+  for (auto& e : std::filesystem::directory_iterator(data_dir)) {
+    std::string name = e.path().filename().string();
+    if (!e.is_regular_file() || e.is_symlink() ||
+	name == "fsid" || name == "type") {
+      continue;
+    }
+    lost.push_back(e.path());
+  }
+  for (auto& f : lost) {
+    std::filesystem::remove(f);
+  }
+  // kv_backend, bluefs, the keys of the freelist manager and ours, at least
+  ASSERT_GT(lost.size(), 4u);
+
+  ASSERT_EQ(0, store->fsck(false));
+  ASSERT_EQ(0, store->mount());
+  std::string v;
+  ASSERT_EQ(0, store->read_meta("zoned_test_key", &v));
+  ASSERT_EQ("v1", v);
+  ASSERT_EQ(0, store->read_meta("kv_backend", &v));
+  ASSERT_FALSE(v.empty());
+
+  // a key written now is there after the next loss of the directory
+  ASSERT_EQ(0, store->write_meta("zoned_test_key", "v2"));
+  store->umount();
+  std::filesystem::remove(std::filesystem::path(data_dir) / "zoned_test_key");
+  ASSERT_EQ(0, store->mount());
+  ASSERT_EQ(0, store->read_meta("zoned_test_key", &v));
+  ASSERT_EQ("v2", v);
+}
+
 TEST_P(StoreTestSpecificAUSize, ZonedUnalignedCapacityTest) {
   if (string(GetParam()) != "bluestore" || !smr) {
     GTEST_SKIP() << "not bluestore on a zoned device, skipping";
