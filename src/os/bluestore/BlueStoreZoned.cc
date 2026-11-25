@@ -18,6 +18,7 @@
 // Without it no block device reports is_smr(), and BlueStoreZoned.h has
 // inline stubs instead.
 
+#include <fcntl.h>
 #include <sys/stat.h>
 
 #include "BlueStore.h"
@@ -34,6 +35,8 @@
 #include "common/debug.h"
 #include "common/errno.h"
 #include "common/pretty_binary.h"
+#include "common/safe_io.h"
+#include "include/compat.h"
 #include "include/intarith.h"
 #include "xxHash/xxhash.h"
 
@@ -338,6 +341,47 @@ int BlueStoreZoned::mkfs_init_main_device(uint64_t reserved)
   return 0;
 }
 
+// The label of block.db, read through a plain file descriptor.
+//
+// read_meta() is called many times while the store is closed, before every
+// mount.  A BlockDevice opened for each call makes an aio queue and destroys
+// it at close, which takes the kernel about 0.1 s each time.  The label is
+// one block at a fixed place, so pread() is enough.
+
+static int open_db_label(const std::string& p)
+{
+  int fd = ::open(p.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
+  if (fd < 0 && errno == EINVAL) {
+    // block.db is a file on a filesystem without O_DIRECT
+    fd = ::open(p.c_str(), O_RDONLY | O_CLOEXEC);
+  }
+  return fd < 0 ? -errno : fd;
+}
+
+static int read_db_label(int fd, bluestore_bdev_label_t *label)
+{
+  ceph::bufferptr bp = ceph::buffer::create_page_aligned(BDEV_LABEL_BLOCK_SIZE);
+  int r = safe_pread_exact(fd, bp.c_str(), BDEV_LABEL_BLOCK_SIZE,
+			   BDEV_FIRST_LABEL_POSITION);
+  if (r < 0) {
+    return r;
+  }
+  bufferlist bl;
+  bl.append(bp);
+  uint32_t crc, expected_crc;
+  auto i = bl.cbegin();
+  try {
+    decode(*label, i);
+    bufferlist t;
+    t.substr_of(bl, 0, i.get_off());
+    crc = t.crc32c(-1);
+    decode(expected_crc, i);
+  } catch (ceph::buffer::error& e) {
+    return -ENOENT;
+  }
+  return crc == expected_crc ? 0 : -EIO;
+}
+
 int BlueStoreZoned::write_meta(const std::string& key,
 			       const std::string& value)
 {
@@ -392,8 +436,12 @@ int BlueStoreZoned::read_meta(const std::string& key, std::string *value)
     r = BlueStore::_read_bdev_label(bstore->cct, dev, p, &label,
 				    BDEV_FIRST_LABEL_POSITION);
   } else {
-    r = BlueStore::read_bdev_label_at_pos(bstore->cct, p,
-					  BDEV_FIRST_LABEL_POSITION, &label);
+    int fd = open_db_label(p);
+    if (fd < 0) {
+      return fd;
+    }
+    r = read_db_label(fd, &label);
+    VOID_TEMP_FAILURE_RETRY(::close(fd));
   }
   if (r != 0) {
     return r < 0 ? r : -ENOENT;
