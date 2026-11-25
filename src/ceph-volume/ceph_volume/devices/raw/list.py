@@ -12,18 +12,42 @@ from ceph_volume.api import lvm
 logger = logging.getLogger(__name__)
 
 
-def direct_report(devices: Optional[_List[str]] = None) -> Dict[str, Any]:
+def direct_report(devices: Optional[_List[str]] = None,
+                  keep_incomplete: bool = False) -> Dict[str, Any]:
     """
     Other non-cli consumers of listing information will want to consume the
     report without the need to parse arguments or other flags. This helper
     bypasses the need to deal with the class interface which is meant for cli
     handling.
+
+    With ``keep_incomplete`` an OSD whose main device was scanned without the
+    device that has its ``whoami`` is reported too, without ``osd_id`` and
+    ``ceph_fsid``. See ``_get_bluestore_info()``.
     """
     _list = List([])
-    return _list.generate(devices)
+    return _list.generate(devices, keep_incomplete)
 
-def _get_bluestore_info(devices: _List[str]) -> Dict[str, Any]:
+def _get_bluestore_info(devices: _List[str],
+                        keep_incomplete: bool = False) -> Dict[str, Any]:
+    """
+    Build the report from the labels of ``devices``, keyed by osd_uuid.
+
+    The label of a main device normally has ``whoami`` and ``ceph_fsid``. A
+    zoned main device without conventional zones cannot rewrite its label
+    after mkfs, and BlueStore keeps these keys in the label of the block.db
+    device of such an OSD. They are taken from there, and the entry gets
+    ``meta_in_db`` so that activation gives both devices to prime-osd-dir.
+
+    A main label without ``whoami`` whose block.db was not scanned, or has no
+    ``whoami`` either, is not a usable OSD. It is logged and left out, unless
+    ``keep_incomplete`` is set: then it is reported without ``osd_id``, for a
+    caller that will look for the block.db device itself.
+    """
     result: Dict[str, Any] = {}
+    # osd_uuid -> main device whose label has no whoami
+    without_id: Dict[str, Dict[str, Any]] = {}
+    # osd_uuid -> the keys as found in the label of the block.db device
+    in_db: Dict[str, Dict[str, Any]] = {}
     command: _List[str] = ['ceph-bluestore-tool',
                            'show-label', '--bdev_aio_poll_ms=1']
     for device in devices:
@@ -38,13 +62,35 @@ def _get_bluestore_info(devices: _List[str]) -> Dict[str, Any]:
                 # should be impossible, so warn
                 logger.warning(f'skipping device {device} because it is not reported in ceph-bluestore-tool output: {out}')
             if oj.get(device):
+                label = oj[device]
                 try:
-                    osd_uuid = oj[device]['osd_uuid']
+                    osd_uuid = label['osd_uuid']
+                    description = label['description']
+                    if description == 'main' and 'whoami' not in label:
+                        without_id[osd_uuid] = {
+                            'osd_uuid': osd_uuid,
+                            'type': label.get('type', 'bluestore'),
+                            'device': device,
+                        }
+                        continue
                     result.setdefault(osd_uuid, {}).update(disk.bluestore_info(device, oj))
+                    if description == 'bluefs db' and 'whoami' in label and 'ceph_fsid' in label:
+                        in_db[osd_uuid] = {
+                            'osd_id': int(label['whoami']),
+                            'ceph_fsid': label['ceph_fsid'],
+                            'meta_in_db': True,
+                        }
                 except KeyError as e:
                     # this will appear for devices that have a bluestore header but aren't valid OSDs
                     # for example, due to incomplete rollback of OSDs: https://tracker.ceph.com/issues/51869
                     logger.error(f'device {device} does not have all BlueStore data needed to be a valid OSD: {out}\n{e}')
+        for osd_uuid, main in without_id.items():
+            if osd_uuid in in_db:
+                main.update(in_db[osd_uuid])
+            elif not keep_incomplete:
+                logger.error(f"device {main['device']} does not have all BlueStore data needed to be a valid OSD: {out}\n'whoami'")
+                continue
+            result.setdefault(osd_uuid, {}).update(main)
     return result
 
 
@@ -122,7 +168,8 @@ class List(object):
 
         return device
 
-    def generate(self, devices: Optional[_List[str]] = None) -> Dict[str, Any]:
+    def generate(self, devices: Optional[_List[str]] = None,
+                 keep_incomplete: bool = False) -> Dict[str, Any]:
         logger.debug('Listing block devices via lsblk...')
         if not devices or not any(devices):
             # If no devs are given initially, we want to list ALL devices including children and
@@ -149,7 +196,7 @@ class List(object):
 
         result: Dict[str, Any] = {}
         logger.debug('inspecting devices: {}'.format(self.devices_to_scan))
-        result = _get_bluestore_info(self.devices_to_scan)
+        result = _get_bluestore_info(self.devices_to_scan, keep_incomplete)
 
         return result
 
