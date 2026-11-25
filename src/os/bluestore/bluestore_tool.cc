@@ -502,8 +502,9 @@ int main(int argc, char **argv)
     }
   }
   if (action == "prime-osd-dir") {
-    if (devs.size() != 1) {
-      cerr << "must specify the main bluestore device" << std::endl;
+    if (devs.size() != 1 && devs.size() != 2) {
+      cerr << "must specify the main bluestore device, and may specify"
+	   << " the DB device after it" << std::endl;
       exit(EXIT_FAILURE);
     }
     if (path.empty()) {
@@ -763,6 +764,26 @@ int main(int argc, char **argv)
       cerr << "failed to read label for " << devs.front() << ": "
 	   << cpp_strerror(r) << std::endl;
       exit(EXIT_FAILURE);
+    }
+    if (devs.size() == 2) {
+      // A zoned main device without conventional zones cannot rewrite its
+      // label, so BlueStore keeps the meta keys in the label of the DB
+      // device.  Take from there what the main label does not have.
+      bluestore_bdev_label_t db_label;
+      r = BlueStore::read_bdev_label(cct.get(), devs[1], &db_label);
+      if (r < 0) {
+	cerr << "failed to read label for " << devs[1] << ": "
+	     << cpp_strerror(r) << std::endl;
+	exit(EXIT_FAILURE);
+      }
+      if (db_label.osd_uuid != label.osd_uuid) {
+	cerr << devs[1] << " belongs to osd " << db_label.osd_uuid << ", "
+	     << devs.front() << " to osd " << label.osd_uuid << std::endl;
+	exit(EXIT_FAILURE);
+      }
+      for (auto& [k, v] : db_label.meta) {
+	label.meta.emplace(k, v);
+      }
     }
 
     // kludge some things into the map that we want to populate into

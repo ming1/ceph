@@ -25,7 +25,7 @@ Synopsis
 | **ceph-bluestore-tool** show-label-at --dev *device* --offset *lba* ...
 | **ceph-bluestore-tool** set-label-key --dev *device* -k *key* -v *value*
 | **ceph-bluestore-tool** rm-label-key --dev *device* -k *key*
-| **ceph-bluestore-tool** prime-osd-dir --dev *device* --path *osd path*
+| **ceph-bluestore-tool** prime-osd-dir --dev *device* [ --dev *db device* ] --path *osd path*
 | **ceph-bluestore-tool** bluefs-export --path *osd path* --out-dir *dir*
 | **ceph-bluestore-tool** bluefs-bdev-new-wal --path *osd path* --dev-target *new-device*
 | **ceph-bluestore-tool** bluefs-bdev-new-db --path *osd path* --dev-target *new-device*
@@ -306,6 +306,12 @@ You can generate the content for an OSD data directory that can start up a
 BlueStore OSD with the *prime-osd-dir* command::
 
   ceph-bluestore-tool prime-osd-dir --dev *main device* --path /var/lib/ceph/osd/ceph-*id*
+
+A zoned main device without conventional zones cannot rewrite its label.
+BlueStore keeps the label keys of such an OSD in the label of its DB device.
+Give that device after the main device, and the keys are taken from it::
+
+  ceph-bluestore-tool prime-osd-dir --dev *main device* --dev *db device* --path /var/lib/ceph/osd/ceph-*id*
 
 BlueFS log rescue
 =====================
