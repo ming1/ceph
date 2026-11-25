@@ -30,6 +30,8 @@ class Raw(BaseObjectStore):
         self.block_device_path = getattr(self.args, 'data', '')
         self.db_device_path = getattr(self.args, 'block_db', '')
         self.wal_device_path = getattr(self.args, 'block_wal', '')
+        # the label of block.db has whoami and ceph_fsid, not the main one
+        self.meta_in_db: bool = False
 
     def prepare_dmcrypt(self) -> None:
         """
@@ -172,6 +174,10 @@ class Raw(BaseObjectStore):
             '--no-mon-config',
             '--dev', self.block_device_path,
         ]
+        if self.meta_in_db and self.db_device_path:
+            # a zoned main device without conventional zones: the keys of the
+            # OSD directory are in the label of block.db
+            prime_command.extend(['--dev', self.db_device_path])
         process.run(prime_command)
 
         # always re-do the symlink regardless if it exists, so that the block,
@@ -217,7 +223,7 @@ class Raw(BaseObjectStore):
             if luks2.is_ceph_encrypted:
                 if luks2.is_tpm2_enrolled and self.osd_fsid == luks2.osd_fsid:
                     self.pre_activate_tpm2(device)
-        found = direct_report(self.devices)
+        found = direct_report(self.devices, keep_incomplete=True)
 
         # When activation is scoped to an explicit device list, that scan only
         # sees the devices named on the command line. An OSD whose block.db or
@@ -232,7 +238,12 @@ class Raw(BaseObjectStore):
         # callers such as Rook invoke this with a device but without --osd-id or
         # --osd-uuid, and widening the activation set would try to activate
         # every foreign OSD present on the host.
+        #
+        # The same scan finds the OSD id of a zoned main device without
+        # conventional zones: its label has no whoami, the label of its block.db
+        # has it.
         if self.devices and any(not (m.get('device_db') and m.get('device_wal'))
+                                or 'osd_id' not in m
                                 for m in found.values()):
             everything = direct_report()
             for osd_uuid, meta in found.items():
@@ -242,11 +253,23 @@ class Raw(BaseObjectStore):
                         meta[key] = other[key]
                         logger.info(f'resolved {key} {other[key]} for osd '
                                     f'uuid {osd_uuid} by a full device scan')
+                if 'osd_id' not in meta and 'osd_id' in other:
+                    for key in ('osd_id', 'ceph_fsid', 'meta_in_db'):
+                        if key in other:
+                            meta[key] = other[key]
+                    logger.info(f'resolved osd id {meta["osd_id"]} for osd '
+                                f'uuid {osd_uuid} by a full device scan')
 
         filter_osd_id = self.osd_id
         filter_osd_fsid = self.osd_fsid
 
         for osd_uuid, meta in found.items():
+            if 'device' not in meta or 'osd_id' not in meta:
+                # a block.db or block.wal without its main device, or a main
+                # device whose OSD id is in no label that was found
+                logger.warning(f'skipping osd uuid {osd_uuid}: '
+                               f'no main device or no osd id in {meta}')
+                continue
             realpath_device = os.path.realpath(meta['device'])
             if lvm_api.is_ceph_volume_lvm_prepared(realpath_device,
                                                    lvm_prepare_lv_paths):
@@ -261,6 +284,7 @@ class Raw(BaseObjectStore):
             self.block_device_path = meta.get('device')
             self.db_device_path = meta.get('device_db', '')
             self.wal_device_path = meta.get('device_wal', '')
+            self.meta_in_db = bool(meta.get('meta_in_db', False))
             logger.info(f'Activating osd.{osd_id} uuid {osd_uuid} cluster {meta["ceph_fsid"]}')
             self._activate()
             activated_any = True
