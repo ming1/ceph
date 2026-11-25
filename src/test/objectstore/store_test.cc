@@ -13775,6 +13775,104 @@ TEST_P(StoreTestSpecificAUSize, ZonedCleanerV2Test) {
   doZonedCleanerTest(store.get(), false);
 }
 
+// Many writes smaller than the allocation unit, with holes between them.  On
+// a zoned device a small write cannot go into the unit that holds the data
+// around it, so it has to take that data along to its new unit, or the
+// object keeps one unit and one blob per write.
+void doZonedSparseSmallWriteTest(ObjectStore *store)
+{
+  const uint64_t au = 4096;
+  const unsigned units = 256;
+  const uint64_t step = 200;
+  const uint64_t len = 100;
+  const uint64_t obj_size = units * au;
+
+  int r;
+  coll_t cid(spg_t(pg_t(0, 555), shard_id_t::NO_SHARD));
+  ghobject_t hoid(hobject_t(sobject_t("sparse", CEPH_NOSNAP), "", 0, 555, ""));
+  auto ch = store->create_new_collection(cid);
+  {
+    ObjectStore::Transaction t;
+    t.create_collection(cid, 0);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+  struct store_statfs_t before;
+  ASSERT_EQ(0, store->statfs(&before));
+
+  std::string expected(obj_size, '\0');
+  std::mt19937_64 rng(1);
+  // two passes: the second one overwrites a part of every piece of the first
+  for (uint64_t shift : {uint64_t(0), len / 2}) {
+    for (uint64_t off = shift; off + len <= obj_size; off += step) {
+      std::string piece(len, 0);
+      for (auto& x : piece) {
+	x = 'a' + rng() % 26;
+      }
+      expected.replace(off, len, piece);
+      bufferlist bl;
+      bl.append(piece);
+      ObjectStore::Transaction t;
+      t.write(cid, hoid, off, bl.length(), bl);
+      r = queue_transaction(store, ch, std::move(t));
+      ASSERT_EQ(r, 0);
+    }
+  }
+  const uint64_t size = (obj_size - len) / step * step + len / 2 + len;
+
+  auto verify = [&]() {
+    bufferlist in;
+    r = store->read(ch, hoid, 0, obj_size, in);
+    ASSERT_EQ((int)size, r);
+    ASSERT_TRUE(in.to_str() == expected.substr(0, size));
+  };
+  verify();
+
+  // The object has data in every one of its allocation units, and cannot
+  // need many more than that.
+  struct store_statfs_t after;
+  ASSERT_EQ(0, store->statfs(&after));
+  std::cout << "allocated 0x" << std::hex << (after.allocated - before.allocated)
+	    << " for 0x" << obj_size << std::dec << ", gc merged "
+	    << store->get_perf_counters()->get(l_bluestore_gc_merged)
+	    << std::endl;
+  ASSERT_LE(after.allocated - before.allocated, 2 * obj_size);
+
+  ch.reset();
+  ASSERT_EQ(0, store->umount());
+  ASSERT_EQ(0, store->fsck(true));
+  ASSERT_EQ(0, store->mount());
+  ch = store->open_collection(cid);
+  verify();
+  {
+    ObjectStore::Transaction t;
+    t.remove(cid, hoid);
+    t.remove_collection(cid);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+}
+
+TEST_P(StoreTestSpecificAUSize, ZonedSparseSmallWriteTest) {
+  if (string(GetParam()) != "bluestore" || !smr) {
+    GTEST_SKIP() << "not bluestore on a zoned device, skipping";
+  }
+  SetVal(g_conf(), "bluestore_write_v2", "false");
+  g_conf().apply_changes(nullptr);
+  StartDeferred(4096);
+  doZonedSparseSmallWriteTest(store.get());
+}
+
+TEST_P(StoreTestSpecificAUSize, ZonedSparseSmallWriteV2Test) {
+  if (string(GetParam()) != "bluestore" || !smr) {
+    GTEST_SKIP() << "not bluestore on a zoned device, skipping";
+  }
+  SetVal(g_conf(), "bluestore_write_v2", "true");
+  g_conf().apply_changes(nullptr);
+  StartDeferred(4096);
+  doZonedSparseSmallWriteTest(store.get());
+}
+
 TEST_P(StoreTestOmapUpgrade, NoOmapHeader) {
   if (string(GetParam()) != "bluestore")
     return;
