@@ -217,6 +217,98 @@ class TestRaw:
         assert m_exists.mock_calls == calls
         assert m_create_osd_path.mock_calls == [call('1', tmpfs=True)]
 
+    @patch('ceph_volume.conf.cluster', 'ceph')
+    @patch(
+        'ceph_volume.objectstore.raw.RawOsdCryptMappers.backing_device_path',
+        return_value='',
+    )
+    @patch('ceph_volume.objectstore.raw.prepare_utils.link_db')
+    @patch('ceph_volume.objectstore.raw.prepare_utils.link_block')
+    @patch('os.path.lexists', Mock(return_value=False))
+    @patch('ceph_volume.objectstore.raw.prepare_utils.create_osd_path')
+    @patch('ceph_volume.objectstore.raw.process.run')
+    def test__activate_meta_in_db(self,
+                                  m_run,
+                                  m_create_osd_path,
+                                  m_link_block,
+                                  m_link_db,
+                                  m_backing_device_path,
+                                  monkeypatch,
+                                  factory):
+        # a zoned main device without conventional zones: prime-osd-dir gets
+        # the block.db device too, its label has the keys
+        self.raw_bs.args = factory(no_tmpfs=False)
+        self.raw_bs.block_device_path = '/dev/nvme0n2'
+        self.raw_bs.db_device_path = '/dev/nvme0n1'
+        self.raw_bs.wal_device_path = ''
+        self.raw_bs.meta_in_db = True
+        monkeypatch.setattr(system, 'chown', lambda path: 0)
+        monkeypatch.setattr(system, 'path_is_mounted', lambda path: 0)
+        self.raw_bs.osd_id = '7'
+        self.raw_bs.osd_fsid = 'zoned-uuid'
+        self.raw_bs._activate()
+        assert m_run.mock_calls == [call(['ceph-bluestore-tool',
+                                         'prime-osd-dir',
+                                         '--path', '/var/lib/ceph/osd/ceph-7',
+                                         '--no-mon-config',
+                                         '--dev', '/dev/nvme0n2',
+                                         '--dev', '/dev/nvme0n1'])]
+
+    @patch('ceph_volume.objectstore.raw.disk.lsblk_all', Mock(return_value=[]))
+    def test_activate_osd_id_from_full_scan(self, is_root, monkeypatch):
+        # the scan of the named device finds a main label without whoami;
+        # the full scan finds the block.db device, whose label has it
+        full = {'zoned-uuid': {'osd_uuid': 'zoned-uuid',
+                               'type': 'bluestore',
+                               'device': '/dev/nvme0n2',
+                               'device_db': '/dev/nvme0n1',
+                               'osd_id': 7,
+                               'ceph_fsid': 'cluster-fsid',
+                               'meta_in_db': True},
+                'other-uuid': {'osd_uuid': 'other-uuid',
+                               'type': 'bluestore',
+                               'device': '/dev/sdx',
+                               'osd_id': 3,
+                               'ceph_fsid': 'cluster-fsid'}}
+
+        def report(devices=None, keep_incomplete=False):
+            if devices:
+                assert keep_incomplete
+                return {'zoned-uuid': {'osd_uuid': 'zoned-uuid',
+                                       'type': 'bluestore',
+                                       'device': '/dev/nvme0n2'}}
+            return full
+        monkeypatch.setattr('ceph_volume.objectstore.raw.direct_report', report)
+        self.raw_bs._activate = MagicMock()
+        self.raw_bs.devices = ['/dev/nvme0n2']
+        self.raw_bs.osd_id = None
+        self.raw_bs.osd_fsid = None
+        self.raw_bs.activate()
+        self.raw_bs._activate.assert_called_once_with()
+        assert self.raw_bs.osd_id == '7'
+        assert self.raw_bs.block_device_path == '/dev/nvme0n2'
+        assert self.raw_bs.db_device_path == '/dev/nvme0n1'
+        assert self.raw_bs.meta_in_db is True
+
+    @patch('ceph_volume.objectstore.raw.disk.lsblk_all', Mock(return_value=[]))
+    def test_activate_skips_what_has_no_main_device_or_no_id(self,
+                                                             is_root,
+                                                             monkeypatch):
+        found = {'db-only-uuid': {'osd_uuid': 'db-only-uuid',
+                                  'device_db': '/dev/sdy'},
+                 'no-id-uuid': {'osd_uuid': 'no-id-uuid',
+                                'type': 'bluestore',
+                                'device': '/dev/nvme0n2'}}
+        monkeypatch.setattr('ceph_volume.objectstore.raw.direct_report',
+                            lambda devices=None, keep_incomplete=False: found)
+        self.raw_bs._activate = MagicMock()
+        self.raw_bs.devices = []
+        self.raw_bs.osd_id = '7'
+        with pytest.raises(RuntimeError) as error:
+            self.raw_bs.activate()
+        assert str(error.value) == 'did not find any matching OSD to activate'
+        self.raw_bs._activate.assert_not_called()
+
     def test_activate_raises_exception(self,
                                        is_root,
                                        mock_raw_direct_report):
