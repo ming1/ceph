@@ -129,6 +129,15 @@ public:
   /// write the label into the first zone and pad the reserved space
   int mkfs_init_main_device(uint64_t reserved);
   void mkfs_super(KeyValueDB::Transaction& t);
+  /// A device without conventional zones cannot rewrite its label, so the
+  /// meta keys of the store are kept in the label of block.db.
+  /// write_meta() does nothing while BlueFS is not open: that is at mkfs,
+  /// for the keys written before block.db has a label.  With BlueFS open a
+  /// label that cannot be read or written, or is not ours, is an error.
+  int write_meta(const std::string& key, const std::string& value);
+  /// @return 0 if the label of block.db is ours and has the key, a negative
+  /// error if not
+  int read_meta(const std::string& key, std::string *value);
   void fsck_note_blob(
     const bluestore_blob_t& blob,
     std::map<uint32_t, uint64_t>& zone_first_offsets);
@@ -238,6 +247,18 @@ inline int BlueStoreZoned::mkfs_init_main_device(uint64_t reserved)
 }
 
 inline void BlueStoreZoned::mkfs_super(KeyValueDB::Transaction& t)
+{
+  BLUESTORE_ZONED_STUB;
+}
+
+inline int BlueStoreZoned::write_meta(const std::string& key,
+				      const std::string& value)
+{
+  BLUESTORE_ZONED_STUB;
+}
+
+inline int BlueStoreZoned::read_meta(const std::string& key,
+				     std::string *value)
 {
   BLUESTORE_ZONED_STUB;
 }

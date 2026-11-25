@@ -2426,8 +2426,13 @@ int BlueStore::write_meta(const std::string& key, const std::string& value)
   }
   if (bdev->is_smr() && bdev->get_conventional_region_size() == 0) {
     // Pure ZNS: the on-device bdev label lives in a sequential zone and cannot
-    // be rewritten in place after mkfs, so do not store meta key/values in it.
-    // The OSD directory copy (written below) is authoritative; see read_meta().
+    // be rewritten in place after mkfs, so the meta key/values are kept in
+    // the label of block.db, which such a device always has.  The OSD
+    // directory gets its copy below; see read_meta().
+    int r = zoned.write_meta(key, value);
+    if (r < 0) {
+      return r;
+    }
     return ObjectStore::write_meta(key, value);
   }
   string p = path + "/block";
@@ -2470,8 +2475,12 @@ int BlueStore::read_meta(const std::string& key, std::string *value)
     return ObjectStore::read_meta(key, value);
   }
   if (local_bdev->is_smr() && local_bdev->get_conventional_region_size() == 0) {
-    // Pure ZNS: meta key/values are not stored in the on-device label (see
-    // write_meta()); read them from the authoritative OSD directory copy.
+    // Pure ZNS: meta key/values are in the label of block.db (see
+    // write_meta()).  A key that is not there is looked up in the OSD
+    // directory, as it is for any other device.
+    if (zoned.read_meta(key, value) == 0) {
+      return 0;
+    }
     return ObjectStore::read_meta(key, value);
   }
   string p = path + "/block";
