@@ -783,6 +783,27 @@ void BlueStoreZoned::clean_some(ghobject_t oid, uint32_t zone)
   bstore->_txc_state_proc(txc);
 }
 
+void BlueStoreZoned::gc_whole_units(
+  OnodeRef& o,
+  const interval_set<uint64_t>& extents,
+  interval_set<uint64_t> *units)
+{
+  // Garbage collection reads a range of an object and writes it again, one
+  // range after the other.  A range that ends inside an allocation unit is
+  // a small write, and do_write_small() rewrites the whole unit, so the
+  // other ranges in that unit are gone from the extent map before their
+  // turn comes.  Collect whole units, then every unit is in one range.
+  const uint64_t au = bstore->min_alloc_size;
+  for (auto p = extents.begin(); p != extents.end(); ++p) {
+    uint64_t b = p2align<uint64_t>(p.get_start(), au);
+    uint64_t e = std::min<uint64_t>(
+      p2roundup<uint64_t>(p.get_start() + p.get_len(), au), o->onode.size);
+    if (e > b) {
+      units->union_insert(b, e - b);
+    }
+  }
+}
+
 void BlueStoreZoned::do_write_small(
   CollectionRef& c,
   OnodeRef& o,
@@ -791,6 +812,54 @@ void BlueStoreZoned::do_write_small(
   ceph::buffer::list& bl,
   WriteContext *wctx)
 {
+  // A small write cannot go into the allocation unit of the data around
+  // it: that unit is written already and a zone takes no overwrite.  Giving
+  // the write a unit and a blob of its own leaves the rest of the old unit
+  // in the old blob, so an object collects one blob for every small write
+  // that falls into the same unit.  Write the whole unit again instead: read
+  // what the object has before and behind the new data, up to its size, and
+  // put all of it into the one new blob.  Holes are written as zeros.
+  ceph_assert(alloc_len == bstore->min_alloc_size);
+  const uint64_t au_start = p2align<uint64_t>(offset, alloc_len);
+  const uint64_t end = offset + length;
+  ceph_assert(end <= au_start + alloc_len);
+  const uint64_t unit_end = std::min<uint64_t>(
+    au_start + alloc_len, std::max<uint64_t>(o->onode.size, end));
+  auto read_old = [&](uint64_t off, uint64_t len, bufferlist *out) {
+    if (len == 0) {
+      return;
+    }
+    // _do_read() stops at the size of the object
+    int r = bstore->_do_read(c.get(), o, off, len, *out, 0);
+    ceph_assert(r >= 0 && out->length() <= len);
+    if (out->length() < len) {
+      out->append_zero(len - out->length());
+    }
+  };
+  // The extent map must have all the data of the unit: nothing else of this
+  // write context may be on its way to the same unit.  A write has a head
+  // and a tail in different units, and gc_whole_units() sees to it for
+  // garbage collection.
+  for (auto& w : wctx->writes) {
+    ceph_assert(w.logical_offset + w.length0 <= au_start ||
+		w.logical_offset >= au_start + alloc_len);
+  }
+  bufferlist head, tail;
+  read_old(au_start, offset - au_start, &head);
+  read_old(end, unit_end - end, &tail);
+  if (head.length() || tail.length()) {
+    dout(20) << __func__ << " 0x" << std::hex << offset << "~" << length
+	     << " rewrites 0x" << au_start << "~" << (unit_end - au_start)
+	     << std::dec << dendl;
+    bufferlist unit;
+    unit.claim_append(head);
+    unit.claim_append(bl);
+    unit.claim_append(tail);
+    bl = std::move(unit);
+    offset = au_start;
+    length = unit_end - au_start;
+  }
+
   uint64_t b_off = p2phase<uint64_t>(offset, alloc_len);
   uint64_t b_off0 = b_off;
   o->extent_map.punch_hole(c, offset, length, &wctx->old_extents);
