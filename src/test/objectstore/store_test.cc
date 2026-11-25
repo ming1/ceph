@@ -15,6 +15,7 @@
 
 #include <fcntl.h>
 #include <filesystem>
+#include <fstream>
 #include <glob.h>
 #include <kv/KeyValueDB.h>
 #include <stdio.h>
@@ -14051,6 +14052,73 @@ TEST_P(StoreTestSpecificAUSize, ZonedMetaInDbLabelTest) {
   ASSERT_EQ(0, store->mount());
   ASSERT_EQ(0, store->read_meta("zoned_test_key", &v));
   ASSERT_EQ("v2", v);
+}
+
+TEST_P(StoreTestSpecificAUSize, ZonedMetaAfterDbMigrateTest) {
+  if (string(GetParam()) != "bluestore" || !smr) {
+    GTEST_SKIP() << "not bluestore on a zoned device, skipping";
+  }
+  {
+    std::string p = g_conf()->bluestore_block_path;
+    BlockDevice* bdev = BlockDevice::create(g_ceph_context, p, nullptr, nullptr,
+					    nullptr, nullptr);
+    ASSERT_EQ(0, bdev->open(p));
+    bool conventional = bdev->get_conventional_region_size() > 0;
+    bdev->close();
+    delete bdev;
+    if (conventional) {
+      GTEST_SKIP() << "the device has conventional zones, its label holds"
+		   << " the meta keys";
+    }
+  }
+  StartDeferred(65536);
+  ASSERT_EQ(0, store->write_meta("zoned_test_key", "v1"));
+  store->umount();
+
+  // what "ceph-bluestore-tool bluefs-bdev-migrate" does with a new device
+  // for the DB; here the new device is a file next to the store.  The
+  // path is absolute, as the tool makes it: block.db becomes a link to it.
+  std::string new_db =
+    std::filesystem::absolute(data_dir + ".new_db").string();
+  std::filesystem::remove(new_db);
+  {
+    std::ofstream f(new_db);
+  }
+  std::filesystem::resize_file(new_db, 2ull << 30);
+  auto remove_new_db = make_scope_guard([&] {
+    std::filesystem::remove(new_db);
+  });
+  BlueStore* bstore = dynamic_cast<BlueStore*>(store.get());
+  ASSERT_NE(nullptr, bstore);
+  ASSERT_EQ(0, bstore->migrate_to_new_bluefs_device(
+	      {BlueFS::BDEV_DB}, BlueFS::BDEV_NEWDB, new_db));
+  ASSERT_EQ(new_db,
+	    std::filesystem::read_symlink(
+	      std::filesystem::path(data_dir) / "block.db").string());
+
+  // the label of the new device has the keys: the store opens without the
+  // files of its directory, as after "prime-osd-dir"
+  std::vector<std::filesystem::path> lost;
+  for (auto& e : std::filesystem::directory_iterator(data_dir)) {
+    std::string name = e.path().filename().string();
+    if (!e.is_regular_file() || e.is_symlink() ||
+	name == "fsid" || name == "type") {
+      continue;
+    }
+    lost.push_back(e.path());
+  }
+  for (auto& f : lost) {
+    std::filesystem::remove(f);
+  }
+  ASSERT_EQ(0, store->fsck(false));
+  ASSERT_EQ(0, store->mount());
+  std::string v;
+  ASSERT_EQ(0, store->read_meta("zoned_test_key", &v));
+  ASSERT_EQ("v1", v);
+  ASSERT_EQ(0, store->read_meta("kv_backend", &v));
+  ASSERT_FALSE(v.empty());
+  // the fixture umounts; the file goes away after that with remove_new_db,
+  // and the next mkfs of the fixture makes a new block.db link
 }
 
 TEST_P(StoreTestSpecificAUSize, ZonedUnalignedCapacityTest) {
