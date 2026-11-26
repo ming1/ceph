@@ -13632,12 +13632,13 @@ TEST_P(StoreTestSpecificAUSize, ZonedInterruptedCleanTest) {
   BlueStore* bstore = dynamic_cast<BlueStore*>(store.get());
   ceph_assert(bstore);
   const uint64_t zone_size = bstore->get_bdev()->get_zone_size();
+  const uint64_t zone_capacity = bstore->get_bdev()->get_zone_capacity();
   const uint64_t obj_size = 4 * 1024 * 1024;
   if (zone_size > 512 * 1024 * 1024) {
     GTEST_SKIP() << "the zones are too large to fill one of them";
   }
   // fill one zone and half of the next one
-  const unsigned nobj = (zone_size + zone_size / 2) / obj_size;
+  const unsigned nobj = (zone_capacity + zone_capacity / 2) / obj_size;
 
   int r;
   coll_t cid;
@@ -13685,7 +13686,7 @@ TEST_P(StoreTestSpecificAUSize, ZonedInterruptedCleanTest) {
       }
     }
     ASSERT_GT(zone, 0);
-    ASSERT_LT(wp[zone] - zone * zone_size, zone_size);
+    ASSERT_LT(wp[zone] - zone * zone_size, zone_capacity);
     bdev->reset_zone(zone);
     bdev->close();
     delete bdev;
@@ -14120,7 +14121,25 @@ TEST_P(StoreTestSpecificAUSize, ZonedTornWriteTest) {
   if (string(GetParam()) != "bluestore" || !smr) {
     GTEST_SKIP() << "not bluestore on a zoned device, skipping";
   }
-  const uint64_t au = 2 * 1024 * 1024;
+  uint64_t zone_capacity = 0;
+  {
+    std::string p = g_conf()->bluestore_block_path;
+    BlockDevice* bdev = BlockDevice::create(g_ceph_context, p, nullptr, nullptr,
+					    nullptr, nullptr);
+    ASSERT_EQ(0, bdev->open(p));
+    zone_capacity = bdev->get_zone_capacity();
+    bdev->close();
+    delete bdev;
+  }
+  // an allocation unit that does not divide the zone capacity when there is
+  // one, 2M when there is none
+  uint64_t au = 2 * 1024 * 1024;
+  for (uint64_t a = 65536; a <= 4 * 1024 * 1024; a *= 2) {
+    if (zone_capacity % a) {
+      au = a;
+      break;
+    }
+  }
   const uint64_t obj_size = 4 * 1024 * 1024;
   SetVal(g_conf(), "bluestore_max_blob_size", stringify(obj_size).c_str());
   SetVal(g_conf(), "bluestore_cleaner_sleep_interval", "0.01");
@@ -14201,7 +14220,7 @@ TEST_P(StoreTestSpecificAUSize, ZonedTornWriteTest) {
     for (uint64_t z = bdev->get_conventional_region_size() / zone_size;
 	 z + 1 < wp.size(); ++z) {
       uint64_t w = wp[z] - z * zone_size;
-      if (w > 0 && w + au <= zone_size) {
+      if (w > 0 && w + au <= p2align(zone_capacity, au)) {
 	zone = z;
 	rel = w;
       }
@@ -14242,7 +14261,7 @@ TEST_P(StoreTestSpecificAUSize, ZonedTornWriteTest) {
   verify();
 
   // fill the torn zone and start the next one
-  write_objects(zone_size / obj_size + 2);
+  write_objects(zone_capacity / obj_size + 2);
   verify();
   for (int i = 0; i < 2; ++i) {
     ch.reset();
@@ -14334,7 +14353,7 @@ TEST_P(StoreTestSpecificAUSize, ZonedLostWriteTest) {
     for (uint64_t z = bdev->get_conventional_region_size() / zone_size;
 	 z < wp.size(); ++z) {
       uint64_t w = wp[z] - z * zone_size;
-      if (w > 0 && w < zone_size) {
+      if (w > 0 && w < bdev->get_zone_capacity()) {
 	zone = z;
 	rel = w;
       }
