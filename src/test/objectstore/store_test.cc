@@ -14120,6 +14120,257 @@ TEST_P(StoreTestSpecificAUSize, ZonedCloneOverwriteV2CompressedTest) {
   doZonedCloneOverwriteTest(store.get(), true);
 }
 
+// A crash in the middle of a write can leave the device write pointer of
+// a zone inside an allocation unit.  The store must come up, fsck must be
+// clean, and the zone must fill up to where the mount and fsck expect its
+// end.
+TEST_P(StoreTestSpecificAUSize, ZonedTornWriteTest) {
+  if (string(GetParam()) != "bluestore" || !smr) {
+    GTEST_SKIP() << "not bluestore on a zoned device, skipping";
+  }
+  const uint64_t au = 2 * 1024 * 1024;
+  const uint64_t obj_size = 4 * 1024 * 1024;
+  SetVal(g_conf(), "bluestore_max_blob_size", stringify(obj_size).c_str());
+  SetVal(g_conf(), "bluestore_cleaner_sleep_interval", "0.01");
+  g_conf().apply_changes(nullptr);
+  StartDeferred(au);
+
+  int r;
+  coll_t cid(spg_t(pg_t(0, 555), shard_id_t::NO_SHARD));
+  auto ch = store->create_new_collection(cid);
+  {
+    ObjectStore::Transaction t;
+    t.create_collection(cid, 0);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+  auto oid = [&](unsigned i) {
+    return ghobject_t(hobject_t(sobject_t("torn " + stringify(i),
+					  CEPH_NOSNAP),
+				"", i * 2654435761u, 555, ""));
+  };
+  auto content = [&](unsigned i) {
+    bufferlist bl;
+    bufferptr bp(obj_size);
+    std::mt19937_64 rng(i + 1);
+    for (uint64_t off = 0; off < obj_size; off += sizeof(uint64_t)) {
+      uint64_t v = rng();
+      memcpy(bp.c_str() + off, &v, sizeof(v));
+    }
+    bl.append(bp);
+    return bl;
+  };
+  unsigned nobj = 0;
+  auto write_objects = [&](unsigned n) {
+    for (unsigned end = nobj + n; nobj < end; ++nobj) {
+      bufferlist bl = content(nobj);
+      ObjectStore::Transaction t;
+      t.write(cid, oid(nobj), 0, bl.length(), bl);
+      r = queue_transaction(store, ch, std::move(t));
+      ASSERT_EQ(r, 0);
+    }
+  };
+  auto verify = [&]() {
+    for (unsigned i = 0; i < nobj; ++i) {
+      bufferlist expected = content(i);
+      bufferlist in;
+      r = store->read(ch, oid(i), 0, obj_size, in);
+      ASSERT_EQ((int)obj_size, r);
+      ASSERT_TRUE(bl_eq(expected, in)) << "object " << i;
+    }
+  };
+  write_objects(3);
+  ch.reset();
+  ASSERT_EQ(0, store->umount());
+
+  // What cut off writes leave, with nothing about them in the DB: half an
+  // allocation unit behind the write pointer of the zone that is being
+  // filled, and one block at the start of the next zone, which is empty.
+  uint64_t zone_size = 0;
+  int64_t zone = -1;
+  uint64_t rel = 0;
+  auto device_wp = [&](uint64_t z) {
+    std::string p = data_dir + "/block";
+    BlockDevice* bdev = BlockDevice::create(g_ceph_context, p, nullptr, nullptr,
+					    nullptr, nullptr);
+    EXPECT_EQ(0, bdev->open(p));
+    uint64_t w = bdev->get_zones()[z] - z * bdev->get_zone_size();
+    bdev->close();
+    delete bdev;
+    return w;
+  };
+  {
+    std::string p = data_dir + "/block";
+    BlockDevice* bdev = BlockDevice::create(g_ceph_context, p, nullptr, nullptr,
+					    nullptr, nullptr);
+    ASSERT_EQ(0, bdev->open(p));
+    std::vector<uint64_t> wp = bdev->get_zones();
+    zone_size = bdev->get_zone_size();
+    for (uint64_t z = bdev->get_conventional_region_size() / zone_size;
+	 z + 1 < wp.size(); ++z) {
+      uint64_t w = wp[z] - z * zone_size;
+      if (w > 0 && w + au <= zone_size) {
+	zone = z;
+	rel = w;
+      }
+    }
+    ASSERT_GE(zone, 0);
+    ASSERT_EQ(0u, rel % au);
+    ASSERT_EQ((zone + 1) * zone_size, wp[zone + 1]);
+    ASSERT_LT(bdev->get_block_size(), au);
+    auto tear = [&](uint64_t off, uint64_t len) {
+      IOContext ioc(g_ceph_context, NULL, true);
+      bufferlist bl;
+      bl.append(std::string(len, 'x'));
+      ASSERT_EQ(0, bdev->aio_write(off, bl, &ioc, false));
+      bdev->aio_submit(&ioc);
+      ioc.aio_wait();
+      ASSERT_EQ(0, ioc.get_return_value());
+    };
+    tear(wp[zone], au / 2);
+    tear(wp[zone + 1], bdev->get_block_size());
+    bdev->close();
+    delete bdev;
+  }
+  ASSERT_EQ(rel + au / 2, device_wp(zone));
+
+  // fsck opens the store read-only and sees the device as the crash left
+  // it; the mount fills the rest of the two allocation units
+  ASSERT_EQ(0, store->fsck(false));
+  ASSERT_EQ(rel + au / 2, device_wp(zone));
+  ASSERT_EQ(0, store->mount());
+  for (int i = 0; i < 2; ++i) {
+    ASSERT_EQ(0, store->umount());
+    ASSERT_EQ(rel + au, device_wp(zone));
+    ASSERT_EQ(au, device_wp(zone + 1));
+    ASSERT_EQ(0, store->fsck(false));
+    ASSERT_EQ(0, store->mount());
+  }
+  ch = store->open_collection(cid);
+  verify();
+
+  // fill the torn zone and start the next one
+  write_objects(zone_size / obj_size + 2);
+  verify();
+  for (int i = 0; i < 2; ++i) {
+    ch.reset();
+    ASSERT_EQ(0, store->umount());
+    ASSERT_EQ(0, store->fsck(i == 1));
+    ASSERT_EQ(0, store->mount());
+    ch = store->open_collection(cid);
+    verify();
+  }
+  {
+    ObjectStore::Transaction t;
+    for (unsigned i = 0; i < nobj; ++i) {
+      t.remove(cid, oid(i));
+    }
+    t.remove_collection(cid);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+}
+
+// The freelist has an allocation unit as written and the device has only
+// a part of it.  That is lost data, not a cut off write: it must be
+// reported, and the mount must not write to the zone.
+TEST_P(StoreTestSpecificAUSize, ZonedLostWriteTest) {
+  if (string(GetParam()) != "bluestore" || !smr) {
+    GTEST_SKIP() << "not bluestore on a zoned device, skipping";
+  }
+  {
+    std::string p = g_conf()->bluestore_block_path;
+    BlockDevice* bdev = BlockDevice::create(g_ceph_context, p, nullptr, nullptr,
+					    nullptr, nullptr);
+    ASSERT_EQ(0, bdev->open(p));
+    bool conventional = bdev->get_conventional_region_size() > 0;
+    bdev->close();
+    delete bdev;
+    if (!conventional) {
+      GTEST_SKIP() << "the device has no conventional zones, the zone that is"
+		   << " being filled holds the label and cannot be reset";
+    }
+  }
+  const uint64_t au = 2 * 1024 * 1024;
+  const uint64_t obj_size = 4 * 1024 * 1024;
+  SetVal(g_conf(), "bluestore_max_blob_size", stringify(obj_size).c_str());
+  g_conf().apply_changes(nullptr);
+  StartDeferred(au);
+
+  int r;
+  coll_t cid(spg_t(pg_t(0, 555), shard_id_t::NO_SHARD));
+  auto ch = store->create_new_collection(cid);
+  {
+    ObjectStore::Transaction t;
+    t.create_collection(cid, 0);
+    for (unsigned i = 0; i < 3; ++i) {
+      bufferlist bl;
+      bl.append(std::string(obj_size, 'a' + i));
+      t.write(cid,
+	      ghobject_t(hobject_t(sobject_t("lost " + stringify(i),
+					     CEPH_NOSNAP),
+				   "", i * 2654435761u, 555, "")),
+	      0, bl.length(), bl);
+    }
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+  ch.reset();
+  ASSERT_EQ(0, store->umount());
+
+  // Take half an allocation unit off the end of the zone that is being
+  // filled: reset the zone and write all but that half again.
+  uint64_t zone = 0;
+  uint64_t rel = 0;
+  auto device_wp = [&]() {
+    std::string p = data_dir + "/block";
+    BlockDevice* bdev = BlockDevice::create(g_ceph_context, p, nullptr, nullptr,
+					    nullptr, nullptr);
+    EXPECT_EQ(0, bdev->open(p));
+    uint64_t w = bdev->get_zones()[zone] - zone * bdev->get_zone_size();
+    bdev->close();
+    delete bdev;
+    return w;
+  };
+  {
+    std::string p = data_dir + "/block";
+    BlockDevice* bdev = BlockDevice::create(g_ceph_context, p, nullptr, nullptr,
+					    nullptr, nullptr);
+    ASSERT_EQ(0, bdev->open(p));
+    std::vector<uint64_t> wp = bdev->get_zones();
+    uint64_t zone_size = bdev->get_zone_size();
+    for (uint64_t z = bdev->get_conventional_region_size() / zone_size;
+	 z < wp.size(); ++z) {
+      uint64_t w = wp[z] - z * zone_size;
+      if (w > 0 && w < zone_size) {
+	zone = z;
+	rel = w;
+      }
+    }
+    ASSERT_GE(rel, au);
+    ASSERT_EQ(0u, rel % au);
+    bdev->reset_zone(zone);
+    IOContext ioc(g_ceph_context, NULL, true);
+    bufferlist bl;
+    bl.append(std::string(rel - au / 2, 'x'));
+    ASSERT_EQ(0, bdev->aio_write(zone * zone_size, bl, &ioc, false));
+    bdev->aio_submit(&ioc);
+    ioc.aio_wait();
+    ASSERT_EQ(0, ioc.get_return_value());
+    bdev->close();
+    delete bdev;
+  }
+  ASSERT_EQ(rel - au / 2, device_wp());
+
+  ASSERT_NE(0, store->fsck(false));
+  // the mount goes on with a complaint in the log
+  ASSERT_EQ(0, store->mount());
+  ASSERT_EQ(0, store->umount());
+  ASSERT_EQ(rel - au / 2, device_wp());
+  ASSERT_NE(0, store->fsck(false));
+  ASSERT_EQ(0, store->mount());
+}
+
 TEST_P(StoreTestOmapUpgrade, NoOmapHeader) {
   if (string(GetParam()) != "bluestore")
     return;
