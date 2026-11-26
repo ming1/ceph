@@ -95,6 +95,10 @@ class BlueStoreZoned {
   /// zones that init_alloc() found reset on the device but not in the
   /// freelist; post_init_alloc() marks them empty in the freelist
   std::vector<uint64_t> interrupted_cleans;
+  /// The rests of allocation units that a write cut off by a crash left
+  /// unwritten, as device offset and length.  Found by init_alloc() and
+  /// filled by post_init_alloc().
+  std::vector<std::pair<uint64_t, uint64_t>> torn_tails;
 
 public:
   explicit BlueStoreZoned(BlueStore *bstore)

@@ -84,6 +84,7 @@ int BlueStoreZoned::init_alloc(std::map<uint64_t, uint64_t> *zone_adjustments)
   // A read-only open does not get to post_init_alloc().  Whatever it found
   // is found again here, from the state the device and the DB have now.
   interrupted_cleans.clear();
+  torn_tails.clear();
 
   // reconcile zone state
   auto num_zones = bstore->bdev->get_size() / zone_size;
@@ -91,6 +92,36 @@ int BlueStoreZoned::init_alloc(std::map<uint64_t, uint64_t> *zone_adjustments)
     ceph_assert(wp[i] >= i * zone_size);
     ceph_assert(wp[i] <= (i + 1) * zone_size); // pos might be at start of next zone
     uint64_t p = wp[i] - i * zone_size;
+    if (uint64_t tail = p % bstore->min_alloc_size; tail) {
+      if (p % bstore->bdev->get_block_size()) {
+	// nothing can be written at such an offset, see is_valid_io()
+	derr << __func__ << " zone 0x" << std::hex << i
+	     << " device write pointer 0x" << p
+	     << " is not a multiple of the block size 0x"
+	     << bstore->bdev->get_block_size() << std::dec << dendl;
+	return -EIO;
+      }
+      if (zones[i].write_pointer <= p - tail) {
+	// A write that was cut off by a crash left the device write pointer
+	// inside an allocation unit that the freelist knows nothing of.
+	// Everything here works in whole allocation units: the allocator
+	// hands them out from the write pointer on, and fsck counts the dead
+	// bytes in them.  So the rest of this unit is given up: it is counted
+	// as written here, and post_init_alloc() fills it on the device
+	// before anything else is written to the zone.  A read-only open
+	// does not get there, and does not write to the zone either.
+	uint64_t pad = bstore->min_alloc_size - tail;
+	dout(1) << __func__ << " zone 0x" << std::hex << i
+		<< " device write pointer 0x" << p
+		<< " is inside an allocation unit, will fill 0x" << pad
+		<< " up to the next one" << std::dec << dendl;
+	torn_tails.emplace_back(i * zone_size + p, pad);
+	p += pad;
+      }
+      // else the freelist has this unit as written and the device has only
+      // a part of it.  That is not a cut off write, data that was committed
+      // is missing: p stays, and it is reported below.
+    }
     if (zones[i].write_pointer > p &&
 	p == 0 && zones[i].num_dead_bytes == zones[i].write_pointer) {
       // The cleaner resets the zone on the device first and records it in
@@ -160,6 +191,26 @@ void BlueStoreZoned::post_init_alloc(const std::map<uint64_t, uint64_t>& zone_ad
     f->mark_zone_to_clean_free(zone, bstore->db);
   }
   interrupted_cleans.clear();
+  // Fill the allocation units that a cut off write left half written, see
+  // init_alloc().  This comes before the freelist update below: after a
+  // crash in between, the next mount finds the device write pointer on a
+  // unit boundary and ahead of the freelist, which is the usual case.
+  for (const auto& [offset, length] : torn_tails) {
+    dout(1) << __func__ << " filling 0x" << std::hex << offset << "~" << length
+	    << std::dec << " behind a cut off write" << dendl;
+    bufferlist bl;
+    bl.append_zero(length);
+    r = bstore->bdev->write(offset, bl, false);
+    if (r < 0) {
+      derr << __func__ << " failed to fill 0x" << std::hex << offset << "~"
+	   << length << std::dec << ": " << cpp_strerror(r) << dendl;
+    }
+    ceph_assert(r >= 0);
+  }
+  if (!torn_tails.empty()) {
+    bstore->bdev->flush();
+    torn_tails.clear();
+  }
   if (zone_adjustments.empty()) {
     return;
   }
@@ -381,6 +432,12 @@ void BlueStoreZoned::fsck_load(
   auto num_zones = bstore->bdev->get_size() / zone_size;
   for (unsigned i = first_sequential_zone; i < num_zones; ++i) {
     uint64_t p = wp[i] == (i + 1) * zone_size ? zone_size : wp[i] % zone_size;
+    // a write pointer inside an allocation unit that the freelist knows
+    // nothing of counts as one at the end of the unit, as in init_alloc()
+    if (uint64_t tail = p % bstore->min_alloc_size;
+	tail && zones[i].write_pointer <= p - tail) {
+      p += bstore->min_alloc_size - tail;
+    }
     if (zones[i].write_pointer > p &&
 	zones[i].num_dead_bytes < zones[i].write_pointer) {
       derr << "fsck error: zone 0x" << std::hex << i
