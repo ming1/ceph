@@ -210,7 +210,7 @@ namespace bluestore {
     std::map<std::pair<OnodeRef, uint32_t>, uint64_t> new_zone_offset_refs;
     std::map<std::pair<OnodeRef, uint32_t>, uint64_t> old_zone_offset_refs;
 #endif
-    
+
     std::set<SharedBlobRef> shared_blobs;  ///< these need to be updated/written
 
     KeyValueDB::Transaction t; ///< then we will commit this

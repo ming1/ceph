@@ -1,7 +1,7 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
-// 
+//
 // A simple allocator that just hands out space from the next empty zone.  This
 // is temporary, just to get the simplest append-only write workload to work.
 //

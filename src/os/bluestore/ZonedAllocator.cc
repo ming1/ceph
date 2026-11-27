@@ -1,7 +1,7 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
-// 
+//
 // A simple allocator that just hands out space from the next empty zone.  This
 // is temporary, just to get the simplest append-only write workload to work.
 //
@@ -229,23 +229,17 @@ int64_t ZonedAllocator::pick_zone_to_clean(float min_score, uint64_t min_saved)
       best_score = score;
     }
   }
-  if (best_score >= min_score) {
-    ldout(cct, 10) << " zone 0x" << std::hex << best << " with score " << best_score
-		   << ": 0x" << zone_states[best].num_dead_bytes
-		   << " dead and 0x"
-		   << zone_states[best].write_pointer - zone_states[best].num_dead_bytes
-		   << " live bytes" << std::dec << dendl;
-  } else if (best > 0) {
-    ldout(cct, 10) << " zone 0x" << std::hex << best << " with score " << best_score
-		   << ": 0x" << zone_states[best].num_dead_bytes
-		   << " dead and 0x"
-		   << zone_states[best].write_pointer - zone_states[best].num_dead_bytes
-		   << " live bytes" << std::dec
-		   << " but below min_score " << min_score
-		   << dendl;
-    best = -1;
-  } else {
+  if (best < 0) {
     ldout(cct, 10) << " no zones found that are good cleaning candidates" << dendl;
+    return -1;
+  }
+  ldout(cct, 10) << " zone 0x" << std::hex << best << " with score " << best_score
+		 << ": 0x" << zone_states[best].num_dead_bytes
+		 << " dead and 0x" << zone_states[best].get_num_live_bytes()
+		 << " live bytes" << std::dec << dendl;
+  if (best_score < min_score) {
+    ldout(cct, 10) << " the score is below min_score " << min_score << dendl;
+    return -1;
   }
   return best;
 }

@@ -1077,7 +1077,7 @@ private:
   bool debug_extent_map_encode_check = false;
 
   // smr-only
-  uint64_t zone_size = 0;              ///< number of SMR zones 
+  uint64_t zone_size = 0;              ///< size of a zone in bytes
   uint64_t first_sequential_zone = 0;  ///< first SMR zone that is sequential-only
 
   enum {
