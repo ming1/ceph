@@ -1647,3 +1647,82 @@ TEST(Btree2Allocator, try_remove_leftover_split_makes_progress)
   }), extents(a));
 }
 
+
+#ifdef HAVE_LIBZBD
+#include "os/bluestore/ZonedAllocator.h"
+
+namespace {
+// 4 zones of 1M, the first one conventional
+constexpr uint64_t zoned_au = 0x10000;
+constexpr uint64_t zoned_zone_size = 1 << 20;
+constexpr uint64_t zoned_num_zones = 4;
+// what the cleaner thread passes to pick_zone_to_clean()
+constexpr float zoned_min_score = .05;
+constexpr uint64_t zoned_min_saved = zoned_zone_size / 32;
+
+// a full zone with |live| bytes of live data at its end
+zone_state_t zoned_full_zone(uint64_t live) {
+  zone_state_t s;
+  s.write_pointer = zoned_zone_size;
+  s.num_dead_bytes = zoned_zone_size - live;
+  return s;
+}
+
+void zoned_release(ZonedAllocator& a, uint64_t zone, uint64_t offset,
+		   uint64_t length) {
+  interval_set<uint64_t> r;
+  r.insert(zone * zoned_zone_size + offset, length);
+  a.release(r);
+}
+}
+
+// The cleaner marks a zone that still has live bytes after its attempt, so
+// that it does not pick the same zone for ever.  The mark must not outlive
+// the live bytes.
+TEST(ZonedAllocator, marked_zone_with_live_bytes_is_skipped)
+{
+  ZonedAllocator a(g_ceph_context, zoned_num_zones * zoned_zone_size, zoned_au,
+		   zoned_zone_size, 1, "zoned_test");
+  std::vector<zone_state_t> states(zoned_num_zones);
+  states[1] = zoned_full_zone(zoned_au);
+  states[2] = zoned_full_zone(zoned_zone_size / 2);
+  a.init_from_zone_pointers(std::move(states));
+
+  // zone 1 has the best score
+  EXPECT_EQ(1, a.pick_zone_to_clean(zoned_min_score, zoned_min_saved));
+  a.mark_zone_non_cleanable(1);
+  EXPECT_EQ(2, a.pick_zone_to_clean(zoned_min_score, zoned_min_saved));
+  EXPECT_EQ(2, a.pick_zone_to_clean(zoned_min_score, zoned_min_saved));
+
+  // a release in the zone removes the mark
+  zoned_release(a, 1, zoned_zone_size - zoned_au, zoned_au);
+  EXPECT_EQ(0u, a.get_live_bytes(1));
+  EXPECT_EQ(1, a.pick_zone_to_clean(zoned_min_score, zoned_min_saved));
+}
+
+// The cleaner looks at the live bytes of a zone and marks it in two steps.
+// The last release in the zone can come in between: it finds no mark to
+// remove, and no further release follows.  The zone must be picked again.
+TEST(ZonedAllocator, marked_zone_without_live_bytes_is_picked)
+{
+  ZonedAllocator a(g_ceph_context, zoned_num_zones * zoned_zone_size, zoned_au,
+		   zoned_zone_size, 1, "zoned_test");
+  std::vector<zone_state_t> states(zoned_num_zones);
+  states[1] = zoned_full_zone(zoned_au);
+  a.init_from_zone_pointers(std::move(states));
+
+  // the cleaner saw live bytes here ...
+  EXPECT_EQ(zoned_au, a.get_live_bytes(1));
+  // ... the last release arrives ...
+  zoned_release(a, 1, zoned_zone_size - zoned_au, zoned_au);
+  // ... and then the cleaner sets its mark
+  a.mark_zone_non_cleanable(1);
+
+  EXPECT_EQ(0u, a.get_live_bytes(1));
+  EXPECT_EQ(1, a.pick_zone_to_clean(zoned_min_score, zoned_min_saved));
+
+  // a reset zone has nothing to clean
+  a.reset_zone(1);
+  EXPECT_EQ(-1, a.pick_zone_to_clean(zoned_min_score, zoned_min_saved));
+}
+#endif // HAVE_LIBZBD
