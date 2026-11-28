@@ -13982,6 +13982,144 @@ TEST_P(StoreTestSpecificAUSize, ZonedSparseSmallWriteV2Test) {
   doZonedSparseSmallWriteTest(store.get());
 }
 
+// An object shares its data with a clone, and an overwrite then moves the
+// object out of the zone.  The clone still uses the data, so no space is
+// released, but the object has left the zone and must drop its ref to it.
+// With compressible, the data of the object can be compressed; the other
+// data never can, so that it fills the zone.
+void doZonedCloneOverwriteTest(ObjectStore *store, bool compressible)
+{
+  BlueStore* bstore = dynamic_cast<BlueStore*>(store);
+  ceph_assert(bstore);
+  const uint64_t zone_size = bstore->get_bdev()->get_zone_size();
+  const uint64_t obj_size = 64 * 1024;
+  const uint64_t fill_size = 4 * 1024 * 1024;
+  if (zone_size > 512 * 1024 * 1024) {
+    GTEST_SKIP() << "the zones are too large to fill one of them";
+  }
+
+  int r;
+  coll_t cid(spg_t(pg_t(0, 555), shard_id_t::NO_SHARD));
+  auto oid = [&](const std::string& name) {
+    return ghobject_t(hobject_t(sobject_t(name, CEPH_NOSNAP), "", 0, 555, ""));
+  };
+  const ghobject_t head = oid("head"), clone = oid("clone");
+  auto content = [&](uint64_t size, unsigned seed) {
+    bufferptr bp(size);
+    std::mt19937_64 rng(seed);
+    for (uint64_t off = 0; off < size; off += sizeof(uint64_t)) {
+      uint64_t v = rng();
+      memcpy(bp.c_str() + off, &v, sizeof(v));
+    }
+    bufferlist bl;
+    bl.append(bp);
+    return bl;
+  };
+  auto ch = store->create_new_collection(cid);
+  {
+    ObjectStore::Transaction t;
+    t.create_collection(cid, 0);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+  auto obj_content = [&](unsigned seed) {
+    if (!compressible) {
+      return content(obj_size, seed);
+    }
+    bufferlist bl;
+    bl.append(std::string(obj_size, char('a' + seed)));
+    return bl;
+  };
+  bufferlist first = obj_content(1);
+  {
+    ObjectStore::Transaction t;
+    t.write(cid, head, 0, first.length(), first);
+    t.clone(cid, head, clone);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+  // More than a zone of other data: the next write of the object goes to
+  // a zone that has none of its data.
+  const unsigned nfill = zone_size / fill_size + 1;
+  for (unsigned i = 0; i < nfill; ++i) {
+    bufferlist bl = content(fill_size, 100 + i);
+    ObjectStore::Transaction t;
+    t.write(cid, oid("fill " + stringify(i)), 0, bl.length(), bl);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+  bufferlist second = obj_content(2);
+  {
+    ObjectStore::Transaction t;
+    t.write(cid, head, 0, second.length(), second);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+
+  auto verify = [&]() {
+    bufferlist in;
+    r = store->read(ch, head, 0, obj_size, in);
+    ASSERT_EQ((int)obj_size, r);
+    ASSERT_TRUE(bl_eq(second, in));
+    in.clear();
+    r = store->read(ch, clone, 0, obj_size, in);
+    ASSERT_EQ((int)obj_size, r);
+    ASSERT_TRUE(bl_eq(first, in));
+  };
+  verify();
+
+  ch.reset();
+  ASSERT_EQ(0, store->umount());
+  // a ref of the object to the zone it has left is an fsck error
+  ASSERT_EQ(0, store->fsck(true));
+  ASSERT_EQ(0, store->mount());
+  ch = store->open_collection(cid);
+  verify();
+  {
+    ObjectStore::Transaction t;
+    t.remove(cid, head);
+    t.remove(cid, clone);
+    for (unsigned i = 0; i < nfill; ++i) {
+      t.remove(cid, oid("fill " + stringify(i)));
+    }
+    t.remove_collection(cid);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+}
+
+TEST_P(StoreTestSpecificAUSize, ZonedCloneOverwriteTest) {
+  if (string(GetParam()) != "bluestore" || !smr) {
+    GTEST_SKIP() << "not bluestore on a zoned device, skipping";
+  }
+  SetVal(g_conf(), "bluestore_write_v2", "false");
+  g_conf().apply_changes(nullptr);
+  StartDeferred(4096);
+  doZonedCloneOverwriteTest(store.get(), false);
+}
+
+TEST_P(StoreTestSpecificAUSize, ZonedCloneOverwriteV2Test) {
+  if (string(GetParam()) != "bluestore" || !smr) {
+    GTEST_SKIP() << "not bluestore on a zoned device, skipping";
+  }
+  SetVal(g_conf(), "bluestore_write_v2", "true");
+  g_conf().apply_changes(nullptr);
+  StartDeferred(4096);
+  doZonedCloneOverwriteTest(store.get(), false);
+}
+
+TEST_P(StoreTestSpecificAUSize, ZonedCloneOverwriteV2CompressedTest) {
+  if (string(GetParam()) != "bluestore" || !smr) {
+    GTEST_SKIP() << "not bluestore on a zoned device, skipping";
+  }
+  SetVal(g_conf(), "bluestore_write_v2", "true");
+  SetVal(g_conf(), "bluestore_compression_algorithm", "snappy");
+  SetVal(g_conf(), "bluestore_compression_mode", "force");
+  g_conf().apply_changes(nullptr);
+  StartDeferred(4096);
+  doZonedCloneOverwriteTest(store.get(), true);
+}
+
 TEST_P(StoreTestOmapUpgrade, NoOmapHeader) {
   if (string(GetParam()) != "bluestore")
     return;
