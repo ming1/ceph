@@ -2633,6 +2633,10 @@ private:
     OnodeRef& o,
     const BlueStore::FSCK_ObjectCtx& ctx);
 
+  void _fsck_recheck_zone_refs(
+    BlueStoreZoned::fsck_zone_refs_t& zone_refs,
+    BlueStoreRepairer* repairer,
+    int64_t& errors);
   void _fsck_check_objects(FSCKDepth depth,
     FSCK_ObjectCtx& ctx);
 

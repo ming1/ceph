@@ -121,22 +121,47 @@ public:
   /// mkfs: give BlueFS the conventional region
   void mkfs_init_main_device(uint64_t reserved);
   void mkfs_super(KeyValueDB::Transaction& t);
-  /// fsck: the state of the zone ref check
+  /// fsck: the state of the zone ref check.
+  ///
+  /// The check compares two sets of (zone, object) pairs: the zone ref
+  /// keys, and the zones each onode has data in.  One set in memory costs
+  /// about 240 bytes per pair, so the first pass keeps only a count and a
+  /// sum of hashes per zone: a key adds to them, an onode subtracts from
+  /// them.  A zone whose two sets are the same ends at zero.  Only the
+  /// other zones are checked pair by pair, in a second pass over the onodes.
   struct fsck_zone_refs_t {
-    /// the zone ref keys that no onode has claimed yet, per zone:
-    /// object -> offset
-    std::vector<std::unordered_map<ghobject_t, uint64_t>> refs;
+    struct sum_t {
+      int64_t count = 0;
+      uint64_t hash = 0;
+    };
+    std::vector<sum_t> sums;       ///< per zone: the keys minus the onodes
+    std::set<uint32_t> bad_zones;  ///< the zones of the second pass
+    /// second pass: the keys of the bad zones, zone -> object -> offset
+    std::map<uint32_t, std::unordered_map<ghobject_t, uint64_t>> refs;
   };
 
   void fsck_note_blob(
     const bluestore_blob_t& blob,
     std::map<uint32_t, uint64_t>& zone_first_offsets);
+  /// first pass: take the zones the onode has data in off the sums
+  void fsck_note_refs(
+    OnodeRef& o,
+    const std::map<uint32_t, uint64_t>& zone_first_offsets,
+    fsck_zone_refs_t *zone_refs);
+  /// Find the zones that need the second pass, and load their keys.
+  /// Returns false if there is none.
+  bool fsck_load_bad_zones(
+    fsck_zone_refs_t& zone_refs,
+    BlueStoreRepairer* repairer,
+    int64_t& errors);
+  /// second pass: check the onode against the keys of the bad zones
   void fsck_check_refs(
     OnodeRef& o,
     const std::map<uint32_t, uint64_t>& zone_first_offsets,
     fsck_zone_refs_t *zone_refs,
     BlueStoreRepairer *repairer,
     int64_t& errors);
+  /// second pass: the keys that no onode has claimed
   void fsck_check_stray_refs(
     const fsck_zone_refs_t& zone_refs,
     BlueStoreRepairer* repairer,
@@ -243,6 +268,22 @@ inline void BlueStoreZoned::mkfs_super(KeyValueDB::Transaction& t)
 inline void BlueStoreZoned::fsck_note_blob(
   const bluestore_blob_t& blob,
   std::map<uint32_t, uint64_t>& zone_first_offsets)
+{
+  BLUESTORE_ZONED_STUB;
+}
+
+inline void BlueStoreZoned::fsck_note_refs(
+  OnodeRef& o,
+  const std::map<uint32_t, uint64_t>& zone_first_offsets,
+  fsck_zone_refs_t *zone_refs)
+{
+  BLUESTORE_ZONED_STUB;
+}
+
+inline bool BlueStoreZoned::fsck_load_bad_zones(
+  fsck_zone_refs_t& zone_refs,
+  BlueStoreRepairer* repairer,
+  int64_t& errors)
 {
   BLUESTORE_ZONED_STUB;
 }

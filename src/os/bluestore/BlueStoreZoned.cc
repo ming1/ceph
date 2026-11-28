@@ -32,6 +32,7 @@
 #include "common/errno.h"
 #include "common/pretty_binary.h"
 #include "include/intarith.h"
+#include "xxHash/xxhash.h"
 
 #define dout_context bstore->cct
 #define dout_subsys ceph_subsys_bluestore
@@ -287,6 +288,100 @@ void BlueStoreZoned::fsck_note_blob(
   }
 }
 
+// A zone ref key is (zone, offset, object).  This is where the object starts.
+static constexpr size_t ZONE_REF_KEY_OBJECT_POS =
+  sizeof(uint32_t) + sizeof(uint64_t);
+
+// fsck: the hash of one (zone, object) pair.  "okey" is the object's part of
+// a zone ref key.  The offset is left out: the check does not compare it.
+static uint64_t fsck_zone_ref_hash(uint32_t zone, std::string_view okey)
+{
+  return XXH64(okey.data(), okey.size(), zone);
+}
+
+void BlueStoreZoned::fsck_note_refs(
+  OnodeRef& o,
+  const std::map<uint32_t, uint64_t>& zone_first_offsets,
+  fsck_zone_refs_t *zone_refs)
+{
+  if (!zone_first_offsets.empty()) {
+    string key;
+    get_zone_offset_object_key(0, 0, o->oid, &key);
+    auto okey = std::string_view(key).substr(ZONE_REF_KEY_OBJECT_POS);
+    for (auto& [zone, first_offset] : zone_first_offsets) {
+      if (zone >= zone_refs->sums.size()) {
+	// an extent past the end of the device: not an error of the zone refs
+	continue;
+      }
+      auto& s = zone_refs->sums[zone];
+      --s.count;
+      s.hash -= fsck_zone_ref_hash(zone, okey);
+    }
+  }
+  // The onode lists a zone it has no data in.  The sums cannot show this
+  // if the zone has no key for the object either.
+  for (auto& [zone, offset] : o->onode.zone_offset_refs) {
+    if (!zone_first_offsets.count(zone)) {
+      zone_refs->bad_zones.insert(zone);
+    }
+  }
+}
+
+bool BlueStoreZoned::fsck_load_bad_zones(
+  fsck_zone_refs_t& zone_refs,
+  BlueStoreRepairer* repairer,
+  int64_t& errors)
+{
+  for (uint32_t zone = 0; zone < zone_refs.sums.size(); ++zone) {
+    auto& s = zone_refs.sums[zone];
+    if (s.count || s.hash) {
+      dout(10) << __func__ << " zone 0x" << std::hex << zone << std::dec
+	       << " zone ref keys and objects differ, by " << s.count
+	       << " in number" << dendl;
+      zone_refs.bad_zones.insert(zone);
+    }
+  }
+  if (zone_refs.bad_zones.empty()) {
+    return false;
+  }
+  dout(1) << __func__ << " " << zone_refs.bad_zones.size()
+	  << " zone(s) need the check of each zone ref" << dendl;
+
+  auto it = bstore->db->get_iterator(PREFIX_ZONED_CL_INFO,
+				     KeyValueDB::ITERATOR_NOCACHE);
+  for (auto zone : zone_refs.bad_zones) {
+    auto& refs = zone_refs.refs[zone];
+    if (!it || zone >= zone_refs.sums.size()) {
+      // no such zone: fsck_load() has reported its keys as invalid
+      continue;
+    }
+    string zone_start;
+    get_zone_offset_object_key(zone, 0, ghobject_t(), &zone_start);
+    for (it->lower_bound(zone_start); it->valid(); it->next()) {
+      uint32_t z = 0;
+      uint64_t offset = 0;
+      ghobject_t oid;
+      string key = it->key();
+      if (get_key_zone_offset_object(key, &z, &offset, &oid) < 0) {
+	// fsck_load() has reported it
+	continue;
+      }
+      if (z != zone) {
+	break;
+      }
+      if (!refs.emplace(oid, offset).second) {
+	derr << "fsck error: second zone ref in zone 0x" << std::hex << zone
+	     << " offset 0x" << offset << std::dec << " for " << oid << dendl;
+	if (repairer) {
+	  repairer->remove_key(bstore->db, PREFIX_ZONED_CL_INFO, key);
+	}
+	++errors;
+      }
+    }
+  }
+  return true;
+}
+
 void BlueStoreZoned::fsck_check_refs(
   OnodeRef& o,
   const std::map<uint32_t, uint64_t>& zone_first_offsets,
@@ -303,12 +398,14 @@ void BlueStoreZoned::fsck_check_refs(
   size_t fixed = 0;
 
   for (auto& [zone, first_offset] : zone_first_offsets) {
-    if (zone >= zone_refs->refs.size()) {
-      // an extent past the end of the device: not an error of the zone refs
+    auto z = zone_refs->refs.find(zone);
+    if (z == zone_refs->refs.end()) {
+      // not a bad zone
       continue;
     }
-    auto p = zone_refs->refs[zone].find(oid);
-    if (p != zone_refs->refs[zone].end()) {
+    auto& refs = z->second;
+    auto p = refs.find(oid);
+    if (p != refs.end()) {
       if (first_offset < p->second) {
 	dout(20) << " slightly wonky zone ref 0x" << std::hex << zone
 	     << " offset 0x" << p->second
@@ -320,7 +417,7 @@ void BlueStoreZoned::fsck_check_refs(
 		 << " <= first offset 0x" << first_offset
 		 << std::dec << dendl;
       }
-      zone_refs->refs[zone].erase(p);
+      refs.erase(p);
     } else {
       derr << "fsck error: " << oid << " references zone 0x" << std::hex << zone
 	   << " but there is no zone ref" << std::dec << dendl;
@@ -343,7 +440,8 @@ void BlueStoreZoned::fsck_check_refs(
 
   // The onode lists a zone it has no data in.  Just removing the key (as a
   // stray zone ref) is not enough: as long as the onode lists the zone, a
-  // later write of this object into the zone adds no key.
+  // later write of this object into the zone adds no key.  Such a zone is
+  // always a bad zone: fsck_note_refs() has seen to that.
   for (auto p = onode_refs.begin(); p != onode_refs.end(); ) {
     auto zone = p->first;
     if (zone_first_offsets.count(zone)) {
@@ -354,9 +452,9 @@ void BlueStoreZoned::fsck_check_refs(
 	 << zone << " offset 0x" << p->second << std::dec
 	 << " but references nothing there" << dendl;
     ++errors;
-    if (zone < zone_refs->refs.size()) {
+    if (auto z = zone_refs->refs.find(zone); z != zone_refs->refs.end()) {
       // this is the same damage; do not report the key again as stray
-      auto& refs = zone_refs->refs[zone];
+      auto& refs = z->second;
       auto q = refs.find(oid);
       if (q != refs.end()) {
 	if (repairer) {
@@ -400,8 +498,8 @@ void BlueStoreZoned::fsck_check_stray_refs(
   int64_t& errors)
 {
   // what is left has no object that references the zone
-  for (uint32_t zone = 0; zone < zone_refs.refs.size(); ++zone) {
-    for (auto& [oid, offset] : zone_refs.refs[zone]) {
+  for (auto& [zone, refs] : zone_refs.refs) {
+    for (auto& [oid, offset] : refs) {
       derr << "fsck error: stray zone ref 0x" << std::hex << zone
 	   << " offset 0x" << offset << " -> " << std::dec << oid << dendl;
       ++errors;
@@ -450,8 +548,8 @@ void BlueStoreZoned::fsck_load(
   }
 
   if (!shallow) {
-    // load zone refs
-    zone_refs.refs.resize(bstore->bdev->get_size() / zone_size);
+    // add the zone ref keys to the sums
+    zone_refs.sums.resize(num_zones);
     it = bstore->db->get_iterator(PREFIX_ZONED_CL_INFO, KeyValueDB::ITERATOR_NOCACHE);
     if (it) {
       for (it->lower_bound(string());
@@ -462,7 +560,7 @@ void BlueStoreZoned::fsck_load(
 	ghobject_t oid;
 	string key = it->key();
 	int r = get_key_zone_offset_object(key, &zone, &offset, &oid);
-	if (r < 0 || zone >= zone_refs.refs.size()) {
+	if (r < 0 || zone >= num_zones) {
 	  derr << "fsck error: invalid zone ref key " << pretty_binary_string(key)
 	       << dendl;
 	  if (repair) {
@@ -473,16 +571,10 @@ void BlueStoreZoned::fsck_load(
 	}
 	dout(30) << " zone ref 0x" << std::hex << zone << " offset 0x" << offset
 		 << " -> " << std::dec << oid << dendl;
-	if (zone_refs.refs[zone].count(oid)) {
-	  derr << "fsck error: second zone ref in zone 0x" << std::hex << zone
-	       << " offset 0x" << offset << std::dec << " for " << oid << dendl;
-	  if (repair) {
-	    repairer.remove_key(bstore->db, PREFIX_ZONED_CL_INFO, key);
-	  }
-	  ++errors;
-	  continue;
-	}
-	zone_refs.refs[zone][oid] = offset;
+	auto& s = zone_refs.sums[zone];
+	++s.count;
+	s.hash += fsck_zone_ref_hash(
+	  zone, std::string_view(key).substr(ZONE_REF_KEY_OBJECT_POS));
       }
     }
   }

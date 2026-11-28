@@ -6748,8 +6748,7 @@ BlueStore::OnodeRef BlueStore::fsck_check_objects_shallow(
     }
 
     if (bdev->is_smr() && depth != FSCK_SHALLOW) {
-      zoned.fsck_check_refs(o, zone_first_offsets,
-			     ctx.zone_refs, ctx.repairer, errors);
+      zoned.fsck_note_refs(o, zone_first_offsets, ctx.zone_refs);
     }
 
     if (broken) {
@@ -7172,6 +7171,70 @@ void BlueStore::_fsck_check_object_omap(FSCKDepth depth,
   }
 }
 
+// The second pass of the zone ref check.  The first pass, during the walk
+// of the objects, has only found the zones whose zone ref keys and objects
+// do not match.  Walk the objects once more, and check each zone ref of
+// these zones.  A store without such damage has no such zone, and no
+// second pass.
+void BlueStore::_fsck_recheck_zone_refs(
+  BlueStoreZoned::fsck_zone_refs_t& zone_refs,
+  BlueStoreRepairer* repairer,
+  int64_t& errors)
+{
+  int64_t errors_before = errors;
+  if (!zoned.fsck_load_bad_zones(zone_refs, repairer, errors)) {
+    return;
+  }
+  auto it = db->get_iterator(PREFIX_OBJ, KeyValueDB::ITERATOR_NOCACHE);
+  if (it) {
+    CollectionRef c;
+    for (it->lower_bound(string()); it->valid(); it->next()) {
+      // the first pass has reported what is skipped here
+      if (is_extent_shard_key(it->key())) {
+	continue;
+      }
+      ghobject_t oid;
+      if (get_key_object(it->key(), &oid) < 0) {
+	continue;
+      }
+      if (!c || !c->contains(oid)) {
+	c = nullptr;
+	for (auto& p : coll_map) {
+	  if (p.second->contains(oid)) {
+	    c = p.second;
+	    break;
+	  }
+	}
+	if (!c) {
+	  continue;
+	}
+      }
+      OnodeRef o;
+      try {
+	bluestore_decode::throwing_guard g;
+	o.reset(Onode::create_decode(c, oid, it->key(), it->value(), false,
+				     segment_size != 0));
+	o->extent_map.fault_range(db, 0, OBJECT_MAX_SIZE);
+      } catch (const ceph::buffer::error& e) {
+	continue;
+      }
+      map<uint32_t, uint64_t> zone_first_offsets;
+      for (auto& l : o->extent_map.extent_map) {
+	zoned.fsck_note_blob(l.blob->get_blob(), zone_first_offsets);
+      }
+      zoned.fsck_check_refs(o, zone_first_offsets, &zone_refs, repairer,
+			    errors);
+    }
+  }
+  zoned.fsck_check_stray_refs(zone_refs, repairer, errors);
+  if (errors == errors_before) {
+    // the sums of a zone differ, but each of its zone refs is fine
+    derr << "fsck warning: " << zone_refs.bad_zones.size()
+	 << " zone(s) failed the quick check of the zone refs, but no zone"
+	 << " ref is wrong" << dendl;
+  }
+}
+
 void BlueStore::_fsck_check_objects(
   FSCKDepth depth,
   BlueStore::FSCK_ObjectCtx& ctx)
@@ -7572,7 +7635,7 @@ int BlueStore::_fsck_on_open(BlueStore::FSCKDepth depth, bool repair, bluestore_
   size_t sb_ref_mismatches = 0;
 
   /// map of oid -> (first_)offset for each zone
-  BlueStoreZoned::fsck_zone_refs_t zone_refs;   // FIXME: this may be a lot of RAM!
+  BlueStoreZoned::fsck_zone_refs_t zone_refs;
 
   uint64_t num_objects = 0;
   uint64_t num_extents = 0;
@@ -7801,9 +7864,8 @@ int BlueStore::_fsck_on_open(BlueStore::FSCKDepth depth, bool repair, bluestore_
   }
 
   if (bdev->is_smr() && depth != FSCK_SHALLOW) {
-    dout(1) << __func__ << " checking for leaked zone refs" << dendl;
-    zoned.fsck_check_stray_refs(zone_refs, repair ? &repairer : nullptr,
-				 errors);
+    dout(1) << __func__ << " checking zone refs" << dendl;
+    _fsck_recheck_zone_refs(zone_refs, repair ? &repairer : nullptr, errors);
   }
 
   sb_ref_mismatches = sb_ref_counts.count_non_zero();
