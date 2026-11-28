@@ -290,7 +290,7 @@ void BlueStoreZoned::fsck_note_blob(
 void BlueStoreZoned::fsck_check_refs(
   OnodeRef& o,
   const std::map<uint32_t, uint64_t>& zone_first_offsets,
-  std::vector<std::unordered_map<ghobject_t, uint64_t>> *zone_refs,
+  fsck_zone_refs_t *zone_refs,
   BlueStoreRepairer *repairer,
   int64_t& errors)
 {
@@ -303,12 +303,12 @@ void BlueStoreZoned::fsck_check_refs(
   size_t fixed = 0;
 
   for (auto& [zone, first_offset] : zone_first_offsets) {
-    if (zone >= zone_refs->size()) {
+    if (zone >= zone_refs->refs.size()) {
       // an extent past the end of the device: not an error of the zone refs
       continue;
     }
-    auto p = (*zone_refs)[zone].find(oid);
-    if (p != (*zone_refs)[zone].end()) {
+    auto p = zone_refs->refs[zone].find(oid);
+    if (p != zone_refs->refs[zone].end()) {
       if (first_offset < p->second) {
 	dout(20) << " slightly wonky zone ref 0x" << std::hex << zone
 	     << " offset 0x" << p->second
@@ -320,7 +320,7 @@ void BlueStoreZoned::fsck_check_refs(
 		 << " <= first offset 0x" << first_offset
 		 << std::dec << dendl;
       }
-      (*zone_refs)[zone].erase(p);
+      zone_refs->refs[zone].erase(p);
     } else {
       derr << "fsck error: " << oid << " references zone 0x" << std::hex << zone
 	   << " but there is no zone ref" << std::dec << dendl;
@@ -354,9 +354,9 @@ void BlueStoreZoned::fsck_check_refs(
 	 << zone << " offset 0x" << p->second << std::dec
 	 << " but references nothing there" << dendl;
     ++errors;
-    if (zone < zone_refs->size()) {
+    if (zone < zone_refs->refs.size()) {
       // this is the same damage; do not report the key again as stray
-      auto& refs = (*zone_refs)[zone];
+      auto& refs = zone_refs->refs[zone];
       auto q = refs.find(oid);
       if (q != refs.end()) {
 	if (repairer) {
@@ -395,13 +395,13 @@ void BlueStoreZoned::fsck_check_refs(
 }
 
 void BlueStoreZoned::fsck_check_stray_refs(
-  const std::vector<std::unordered_map<ghobject_t, uint64_t>>& zone_refs,
+  const fsck_zone_refs_t& zone_refs,
   BlueStoreRepairer* repairer,
   int64_t& errors)
 {
   // what is left has no object that references the zone
-  for (uint32_t zone = 0; zone < zone_refs.size(); ++zone) {
-    for (auto& [oid, offset] : zone_refs[zone]) {
+  for (uint32_t zone = 0; zone < zone_refs.refs.size(); ++zone) {
+    for (auto& [oid, offset] : zone_refs.refs[zone]) {
       derr << "fsck error: stray zone ref 0x" << std::hex << zone
 	   << " offset 0x" << offset << " -> " << std::dec << oid << dendl;
       ++errors;
@@ -418,7 +418,7 @@ void BlueStoreZoned::fsck_load(
   bool shallow,
   bool repair,
   BlueStoreRepairer& repairer,
-  std::vector<std::unordered_map<ghobject_t, uint64_t>>& zone_refs,
+  fsck_zone_refs_t& zone_refs,
   int64_t& errors)
 {
   KeyValueDB::Iterator it;
@@ -451,7 +451,7 @@ void BlueStoreZoned::fsck_load(
 
   if (!shallow) {
     // load zone refs
-    zone_refs.resize(bstore->bdev->get_size() / zone_size);
+    zone_refs.refs.resize(bstore->bdev->get_size() / zone_size);
     it = bstore->db->get_iterator(PREFIX_ZONED_CL_INFO, KeyValueDB::ITERATOR_NOCACHE);
     if (it) {
       for (it->lower_bound(string());
@@ -462,7 +462,7 @@ void BlueStoreZoned::fsck_load(
 	ghobject_t oid;
 	string key = it->key();
 	int r = get_key_zone_offset_object(key, &zone, &offset, &oid);
-	if (r < 0 || zone >= zone_refs.size()) {
+	if (r < 0 || zone >= zone_refs.refs.size()) {
 	  derr << "fsck error: invalid zone ref key " << pretty_binary_string(key)
 	       << dendl;
 	  if (repair) {
@@ -473,7 +473,7 @@ void BlueStoreZoned::fsck_load(
 	}
 	dout(30) << " zone ref 0x" << std::hex << zone << " offset 0x" << offset
 		 << " -> " << std::dec << oid << dendl;
-	if (zone_refs[zone].count(oid)) {
+	if (zone_refs.refs[zone].count(oid)) {
 	  derr << "fsck error: second zone ref in zone 0x" << std::hex << zone
 	       << " offset 0x" << offset << std::dec << " for " << oid << dendl;
 	  if (repair) {
@@ -482,7 +482,7 @@ void BlueStoreZoned::fsck_load(
 	  ++errors;
 	  continue;
 	}
-	zone_refs[zone][oid] = offset;
+	zone_refs.refs[zone][oid] = offset;
       }
     }
   }

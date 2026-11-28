@@ -2505,7 +2505,7 @@ public:
 
     mempool_dynamic_bitset* used_blocks;
     uint64_t_btree_t* used_omap_head;
-    std::vector<std::unordered_map<ghobject_t, uint64_t>> *zone_refs;
+    BlueStoreZoned::fsck_zone_refs_t *zone_refs;
 
     ceph::mutex* sb_info_lock;
     sb_info_space_efficient_map_t& sb_info;
@@ -2526,7 +2526,7 @@ public:
                    uint64_t& _num_spanning_blobs,
                    mempool_dynamic_bitset* _ub,
                    uint64_t_btree_t* _used_omap_head,
-		   std::vector<std::unordered_map<ghobject_t, uint64_t>> *_zone_refs,
+		   BlueStoreZoned::fsck_zone_refs_t *_zone_refs,
 
                    ceph::mutex* _sb_info_lock,
                    sb_info_space_efficient_map_t& _sb_info,

@@ -121,24 +121,31 @@ public:
   /// mkfs: give BlueFS the conventional region
   void mkfs_init_main_device(uint64_t reserved);
   void mkfs_super(KeyValueDB::Transaction& t);
+  /// fsck: the state of the zone ref check
+  struct fsck_zone_refs_t {
+    /// the zone ref keys that no onode has claimed yet, per zone:
+    /// object -> offset
+    std::vector<std::unordered_map<ghobject_t, uint64_t>> refs;
+  };
+
   void fsck_note_blob(
     const bluestore_blob_t& blob,
     std::map<uint32_t, uint64_t>& zone_first_offsets);
   void fsck_check_refs(
     OnodeRef& o,
     const std::map<uint32_t, uint64_t>& zone_first_offsets,
-    std::vector<std::unordered_map<ghobject_t, uint64_t>> *zone_refs,
+    fsck_zone_refs_t *zone_refs,
     BlueStoreRepairer *repairer,
     int64_t& errors);
   void fsck_check_stray_refs(
-    const std::vector<std::unordered_map<ghobject_t, uint64_t>>& zone_refs,
+    const fsck_zone_refs_t& zone_refs,
     BlueStoreRepairer* repairer,
     int64_t& errors);
   void fsck_load(
     bool shallow,
     bool repair,
     BlueStoreRepairer& repairer,
-    std::vector<std::unordered_map<ghobject_t, uint64_t>>& zone_refs,
+    fsck_zone_refs_t& zone_refs,
     int64_t& errors);
   void fsck_check_zones(
     mempool_dynamic_bitset& used_blocks,
@@ -243,7 +250,7 @@ inline void BlueStoreZoned::fsck_note_blob(
 inline void BlueStoreZoned::fsck_check_refs(
   OnodeRef& o,
   const std::map<uint32_t, uint64_t>& zone_first_offsets,
-  std::vector<std::unordered_map<ghobject_t, uint64_t>> *zone_refs,
+  fsck_zone_refs_t *zone_refs,
   BlueStoreRepairer *repairer,
   int64_t& errors)
 {
@@ -251,7 +258,7 @@ inline void BlueStoreZoned::fsck_check_refs(
 }
 
 inline void BlueStoreZoned::fsck_check_stray_refs(
-  const std::vector<std::unordered_map<ghobject_t, uint64_t>>& zone_refs,
+  const fsck_zone_refs_t& zone_refs,
   BlueStoreRepairer* repairer,
   int64_t& errors)
 {
@@ -262,7 +269,7 @@ inline void BlueStoreZoned::fsck_load(
   bool shallow,
   bool repair,
   BlueStoreRepairer& repairer,
-  std::vector<std::unordered_map<ghobject_t, uint64_t>>& zone_refs,
+  fsck_zone_refs_t& zone_refs,
   int64_t& errors)
 {
   BLUESTORE_ZONED_STUB;
